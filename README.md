@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="Glossy%20Smartphone-to-NAS%20Sync%20Icon.png" alt="uPhotoSync icon" width="160">
+  <img src="Glossy%20Photo%20Backup%20Sync%20Icon.png" alt="uPhotoSync icon" width="160">
 </p>
 
 <h1 align="center">uPhotoSync</h1>
@@ -32,7 +32,10 @@ To install it, open the APK on your phone. If Android asks, allow your browser o
   - Both can be switched off in Settings.
 - **Encrypted connection:** optional SMB3 encryption. "Test connection" shows whether your NAS supports it.
 - **Backup history:** Settings → History lists recent backups, moves, checks and downloads, with timings, data transferred and any errors.
-- **Viewer:** a full-screen photo viewer for the phone and the NAS. Swipe between photos, pinch or double-tap to zoom. The Device tab groups photos by month.
+- **Viewer:** a full-screen viewer for the phone and the NAS. Swipe between photos, pinch or double-tap to zoom. The Device tab groups photos by month.
+- **Videos:** play in the app, both phone videos and NAS videos. NAS videos stream over SMB with seeking, so nothing is downloaded first. NAS video thumbnails are taken from a frame, reading only a few MB of each file.
+- **Sorting:** both tabs can sort by date, name or size.
+- **Crash reports:** if the app crashes, the next launch offers to share the error details. Nothing is sent automatically.
 - **Thumbnails or details:** switch either tab between a grid and a list showing date, size and backup status.
 - **Automatic backup:** new photos are uploaded shortly after you take them, and a full check runs every 6 hours.
 - **Scheduled backup:** back up everything at a time you choose (for example 2:00 AM) on the days you pick. Android may start it a few minutes late if the phone is idle. A silent notification shows while it runs, then is replaced by a report, e.g. "12 files uploaded in 3 min" or why it was skipped or failed.

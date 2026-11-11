@@ -7,15 +7,15 @@ plugins {
 }
 
 android {
-    namespace = "dev.unifiphotosync.app"
+    namespace = "dev.uphotosync.app"
     compileSdk = 35
 
     defaultConfig {
-        applicationId = "dev.unifiphotosync.app"
+        applicationId = "dev.uphotosync.app"
         minSdk = 29
         targetSdk = 35
-        versionCode = 7
-        versionName = "0.1.6"
+        versionCode = 8
+        versionName = "0.1.7"
     }
 
     // Release signing key lives outside the repo; keystore.properties (git-ignored) points to it.
@@ -88,6 +88,10 @@ dependencies {
     // Thumbnails for device media and NAS files.
     implementation("io.coil-kt:coil-compose:2.7.0")
     implementation("io.coil-kt:coil-video:2.7.0")
+
+    // In-app video playback (phone videos, and NAS videos streamed over SMB).
+    implementation("androidx.media3:media3-exoplayer:1.5.1")
+    implementation("androidx.media3:media3-ui:1.5.1")
 
     // SMB2/3 client for the UniFi NAS share. BouncyCastle supplies MD4/RC4 for NTLM,
     // which Android's built-in crypto provider lacks.
