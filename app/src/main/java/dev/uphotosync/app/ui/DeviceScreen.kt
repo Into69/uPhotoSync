@@ -52,7 +52,10 @@ import androidx.compose.material3.Checkbox
 import androidx.compose.material3.ListItem
 import androidx.compose.material3.ListItemDefaults
 import androidx.compose.ui.text.style.TextOverflow
+import dev.uphotosync.app.data.PhoneStorage
 import dev.uphotosync.app.data.SortOrder
+import dev.uphotosync.app.data.StorageSpace
+import kotlinx.coroutines.flow.asStateFlow
 import dev.uphotosync.app.data.ViewMode
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
@@ -157,6 +160,11 @@ class DeviceViewModel(app: Application) : AndroidViewModel(app) {
     private var reloadJob: Job? = null
 
     /** Reloads from MediaStore; debounced because the observer fires in bursts. */
+    private val _phoneSpace = MutableStateFlow<StorageSpace?>(null)
+
+    /** The phone's storage, refreshed whenever the media list is (e.g. after deleting). */
+    val phoneSpace = _phoneSpace.asStateFlow()
+
     fun reload(debounce: Boolean = false) {
         reloadJob?.cancel()
         reloadJob = viewModelScope.launch {
@@ -165,6 +173,7 @@ class DeviceViewModel(app: Application) : AndroidViewModel(app) {
             all.value = items
             val ids = items.mapTo(HashSet()) { it.id }
             selected.update { it.intersect(ids) }
+            _phoneSpace.value = withContext(Dispatchers.IO) { PhoneStorage.read(getApplication()) }
         }
     }
 
@@ -516,6 +525,8 @@ fun DeviceScreen(onOpenSettings: () -> Unit, vm: DeviceViewModel = viewModel()) 
     ) { padding ->
         Column(Modifier.padding(padding)) {
             BackupStatusBanner()
+            val phoneSpace by vm.phoneSpace.collectAsStateWithLifecycle()
+            StorageLine("Phone", phoneSpace, isNas = false)
             if (moveReady.isNotEmpty()) {
                 Surface(color = MaterialTheme.colorScheme.tertiaryContainer, modifier = Modifier.fillMaxWidth()) {
                     Column(Modifier.padding(start = 16.dp, end = 8.dp, top = 8.dp)) {

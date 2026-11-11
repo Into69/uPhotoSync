@@ -25,6 +25,7 @@ import com.hierynomus.smbj.share.DiskShare
 import dev.uphotosync.app.data.NasConfig
 import dev.uphotosync.app.data.NasPath
 import dev.uphotosync.app.data.SettingsStore
+import dev.uphotosync.app.data.StorageSpace
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
@@ -324,6 +325,15 @@ class NasClient(private val settings: SettingsStore) {
         removed
     }
 
+    /**
+     * Size and free space of the share. Free space is what this NAS user can actually use,
+     * so it respects any quota on the account.
+     */
+    suspend fun space(): StorageSpace = withShare { share ->
+        val info = share.shareInformation
+        StorageSpace(total = info.totalSpace, free = info.callerFreeSpace)
+    }
+
     /** Opens [path] for random-access reading; close it when done. */
     suspend fun openReader(path: String): RemoteReader = withShare { share ->
         val f = share.openFile(
@@ -398,6 +408,7 @@ class NasClient(private val settings: SettingsStore) {
                 NtStatus.STATUS_ACCOUNT_DISABLED -> "That NAS user account is disabled."
                 NtStatus.STATUS_PASSWORD_EXPIRED -> "That NAS user's password has expired."
                 NtStatus.STATUS_ACCESS_DENIED -> "This user doesn't have permission for that share or folder."
+                NtStatus.STATUS_DISK_FULL -> "The NAS is full (or this user's space quota is used up)."
                 NtStatus.STATUS_OBJECT_NAME_NOT_FOUND, NtStatus.STATUS_OBJECT_PATH_NOT_FOUND ->
                     "That folder doesn't exist on the NAS."
                 else -> when {

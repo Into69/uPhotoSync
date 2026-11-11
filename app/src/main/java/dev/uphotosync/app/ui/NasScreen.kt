@@ -32,6 +32,7 @@ import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material3.ListItem
 import dev.uphotosync.app.data.SortOrder
+import dev.uphotosync.app.data.StorageSpace
 import dev.uphotosync.app.data.ViewMode
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.stateIn
@@ -180,6 +181,7 @@ class NasViewModel(app: Application) : AndroidViewModel(app) {
                 val entries = sortEntries(graph.nas.list(path), sort.value)
                 _state.update { it.copy(entries = entries, loading = false) }
                 startPrefetch(entries)
+                refreshSpace()
             } catch (e: NasNotConfiguredException) {
                 started = false
                 _state.update { it.copy(configured = false, loading = false) }
@@ -196,6 +198,16 @@ class NasViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     private var prefetchJob: Job? = null
+
+    private val _space = MutableStateFlow<StorageSpace?>(null)
+
+    /** The share's size and free space, refreshed when a folder loads (and after deletes). */
+    val space = _space.asStateFlow()
+
+    private fun refreshSpace() = viewModelScope.launch {
+        // Not every server reports it; leave the line hidden if it doesn't.
+        runCatching { graph.nas.space() }.onSuccess { _space.value = it }
+    }
 
     /**
      * Once what's on screen has its thumbnails, slowly fill in the rest of this folder so they're
@@ -368,6 +380,8 @@ fun NasScreen(onOpenSettings: () -> Unit, vm: NasViewModel = viewModel()) {
         snackbarHost = { SnackbarHost(snackbar) },
     ) { padding ->
         Column(Modifier.padding(padding)) {
+            val space by vm.space.collectAsStateWithLifecycle()
+            if (state.configured) StorageLine("NAS", space, isNas = true)
             val progress = state.downloadProgress
             when {
                 state.deleting -> LinearProgressIndicator(Modifier.fillMaxWidth())
