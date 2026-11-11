@@ -100,8 +100,9 @@ class BackupWorker(context: Context, params: WorkerParameters) : CoroutineWorker
 
             // "Check backups": make sure the NAS really has everything marked as backed up.
             inputData.getString(KEY_CHECK)?.let { mode ->
+                val albums = graph.settings.prefs.first().albums
                 val report = graph.engine.check(
-                    graph.media.loadAll(),
+                    graph.media.loadAll().filter { albums.isEmpty() || it.bucketId in albums },
                     full = mode == CHECK_FULL,
                     repair = inputData.getBoolean(KEY_REPAIR, true),
                     onProgress = onProgress,
@@ -320,18 +321,22 @@ class BackupWorker(context: Context, params: WorkerParameters) : CoroutineWorker
 
     private fun describeCheck(r: BackupEngine.CheckReport, full: Boolean): Pair<String, String> {
         val kind = if (full) "Full check" else "Quick check"
-        val problems = r.missing + r.different + r.unreadable
-        if (r.checked == 0) return "$kind finished" to "Nothing is marked as backed up yet."
+        // Missing (was backed up, now gone) and never/no-longer backed up look the same to the
+        // user: on the phone, not on the NAS.
+        val notOnNas = r.missing + r.notBackedUp
+        val problems = notOnNas + r.different + r.unreadable
+        if (r.checked == 0) return "$kind finished" to "No photos or videos to check."
         if (problems == 0) {
             // Count only what was actually confirmed; files skipped mid-check weren't compared.
             val all = if (r.ok == r.checked) "All " else ""
             val skippedNote = if (r.skipped > 0) " ${r.skipped} skipped (no longer on the phone)." else ""
             return "$kind: all good" to
-                "$all${r.ok} backed-up ${if (r.ok == 1) "file is" else "files are"} on the NAS" +
-                (if (full) " and identical to the phone." else ".") + skippedNote
+                "$all${r.ok} ${if (r.ok == 1) "photo or video" else "photos and videos"} on this phone " +
+                (if (r.ok == 1) "is" else "are") + " on the NAS" +
+                (if (full) " and identical." else ".") + skippedNote
         }
         val found = buildList {
-            if (r.missing > 0) add("${r.missing} missing")
+            if (notOnNas > 0) add("$notOnNas not on the NAS")
             if (r.different > 0) add("${r.different} different")
             if (r.unreadable > 0) add("${r.unreadable} couldn't be read")
             if (r.skipped > 0) add("${r.skipped} skipped (no longer on the phone)")

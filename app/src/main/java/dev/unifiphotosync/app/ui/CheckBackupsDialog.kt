@@ -32,7 +32,8 @@ fun CheckBackupsDialog(onStart: (full: Boolean, repair: Boolean) -> Unit, onDism
         text = {
             Column {
                 Text(
-                    "Makes sure every photo and video marked as backed up is really on the NAS.",
+                    "Compares this phone with the NAS: every photo and video in your backup albums should " +
+                        "have a copy there, including any deleted on the NAS since.",
                     style = MaterialTheme.typography.bodyMedium,
                     modifier = Modifier.padding(bottom = 8.dp),
                 )

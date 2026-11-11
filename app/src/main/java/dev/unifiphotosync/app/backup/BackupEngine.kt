@@ -89,6 +89,11 @@ class BackupEngine(
         val unreadable: Int,
         /** Not compared, e.g. deleted from the phone during the check (full check only). */
         val skipped: Int,
+        /**
+         * On the phone but not on the NAS, and not marked as backed up: deleted on the NAS
+         * (which unmarks them), never backed up yet, or the backup record was reset.
+         */
+        val notBackedUp: Int = 0,
         /** Re-uploaded to fix the above, if repair was on. */
         val repaired: Int,
         val repairFailed: Int,
@@ -402,7 +407,9 @@ class BackupEngine(
     // --- Check backups ------------------------------------------------------------------
 
     /**
-     * "Check backups": makes sure everything marked as backed up is really on the NAS.
+     * "Check backups": compares the phone with the NAS. Every photo and video in [items] should
+     * have a copy there; ones marked as backed up are checked, and unmarked ones are looked for
+     * (and re-recorded if found), so files deleted on the NAS are reported too.
      * Quick checks name and size from folder listings; [full] also reads every copy back and
      * compares it byte for byte. Damaged copies are remembered so the next backup replaces
      * them; with [repair], that happens now, and anything missing is uploaded again.
@@ -416,12 +423,33 @@ class BackupEngine(
     ): CheckReport = lock.withLock {
         val config = settings.config.first() ?: throw NasNotConfiguredException()
         val marked = items.filter { index.isBackedUp(it) }
-        onProgress(Progress(0, marked.size, 0, null, phase = Phase.Check))
+        onProgress(Progress(0, items.size, 0, null, phase = Phase.Check))
         val cache = FolderCache()
+
+        // 0. Unmarked photos: find their copy where a backup would have put it. Found with
+        // matching size and time means it's there (e.g. after Reset history); re-record it.
+        // Anything not found isn't on the NAS: deleted there, or never backed up.
+        val notBackedUp = ArrayList<MediaItem>()
+        val refound = ArrayList<MediaItem>()
+        nas.withShare { share ->
+            notBackedUp.clear()
+            refound.clear()
+            for (item in items) {
+                currentCoroutineContext().ensureActive()
+                if (index.isBackedUp(item)) continue
+                val dir = remoteDir(config, item)
+                val name = NasPath.safeName(item.name)
+                val remote = cache.files(share, dir)[name.lowercase()]
+                val same = remote != null && remote.size == item.size &&
+                    item.modifiedAt > 0 && abs(remote.modifiedAt - item.modifiedAt) <= TIME_TOLERANCE_MS
+                if (same) refound += item else notBackedUp += item
+            }
+        }
+        refound.forEach { index.mark(it.id, NasPath.join(remoteDir(config, it), NasPath.safeName(it.name)), it.size) }
 
         // 1. Presence and size, from one listing per folder.
         val missingIds = forgetMissing(config, marked, cache).toHashSet()
-        val present = marked.filter { it.id !in missingIds }
+        val present = marked.filter { it.id !in missingIds } + refound
 
         // 2. Content, file by file (full only).
         val damaged = HashMap<Long, String>() // id -> path of the bad copy
@@ -459,8 +487,8 @@ class BackupEngine(
         var aborted = false
         var lastError: String? = null
         var repairErrors: List<String> = emptyList()
-        if (repair && (missingIds.isNotEmpty() || damaged.isNotEmpty())) {
-            val toFix = marked.filter { it.id in missingIds || it.id in damaged }
+        if (repair && (missingIds.isNotEmpty() || damaged.isNotEmpty() || notBackedUp.isNotEmpty())) {
+            val toFix = marked.filter { it.id in missingIds || it.id in damaged } + notBackedUp
             val s = uploadAll(config, toFix, cache, overwrite = index.damaged(), onProgress = onProgress)
             repaired = s.uploaded + s.alreadyThere
             repairFailed = s.failed
@@ -470,12 +498,14 @@ class BackupEngine(
         }
 
         CheckReport(
-            checked = marked.size,
+            // Every phone file in scope was compared with the NAS one way or another.
+            checked = items.size,
             ok = matched,
             missing = missingIds.size,
             different = damaged.size,
             unreadable = unreadable,
-            skipped = marked.size - missingIds.size - matched - damaged.size - unreadable,
+            skipped = present.size - matched - damaged.size - unreadable,
+            notBackedUp = notBackedUp.size,
             repaired = repaired,
             repairFailed = repairFailed,
             aborted = aborted,
