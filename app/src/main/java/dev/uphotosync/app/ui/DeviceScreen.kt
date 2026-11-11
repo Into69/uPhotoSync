@@ -35,12 +35,16 @@ import androidx.activity.result.IntentSenderRequest
 import androidx.compose.material.icons.automirrored.filled.DriveFileMove
 import androidx.compose.material.icons.automirrored.filled.OpenInNew
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Search
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.AlertDialog
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.grid.GridItemSpan
+import androidx.compose.foundation.lazy.grid.rememberLazyGridState
+import androidx.compose.foundation.lazy.rememberLazyListState
 import java.time.Instant
 import java.time.YearMonth
 import java.time.ZoneId
@@ -103,6 +107,9 @@ import coil.compose.AsyncImage
 import coil.request.ImageRequest
 import dev.uphotosync.app.PhotoSyncApp
 import dev.uphotosync.app.backup.BackupScope
+import dev.uphotosync.app.backup.NAS_SPACE_MARGIN
+import kotlinx.coroutines.async
+import kotlinx.coroutines.withTimeoutOrNull
 import dev.uphotosync.app.data.Album
 import dev.uphotosync.app.data.MediaItem
 import kotlinx.coroutines.Job
@@ -124,10 +131,17 @@ data class DeviceUiState(
     val selected: Set<Long> = emptySet(),
     val backedUp: Map<Long, Long> = emptyMap(),
     val sort: SortOrder = SortOrder.DateNewest,
+    /** File-name search; blank shows everything. */
+    val query: String = "",
+    /** Album id -> how many of its items are backed up, for the album picker. */
+    val albumBacked: Map<String, Int> = emptyMap(),
 ) {
     fun isBackedUp(item: MediaItem) = backedUp[item.id] == item.size
     val pending get() = items.count { !isBackedUp(it) }
 }
+
+/** Shown before a backup that won't fit on the NAS. */
+data class SpaceShortfall(val needed: Long, val free: Long)
 
 class DeviceViewModel(app: Application) : AndroidViewModel(app) {
     private val graph = (app as PhotoSyncApp).graph
@@ -135,22 +149,57 @@ class DeviceViewModel(app: Application) : AndroidViewModel(app) {
     private val albumId = MutableStateFlow<String?>(null)
     private val selected = MutableStateFlow<Set<Long>>(emptySet())
 
-    val state = combine(
-        all, albumId, selected, graph.index.sizes, graph.settings.sortOrder("device", SortOrder.DateNewest),
-    ) { all, albumId, selected, sizes, sort ->
+    private val query = MutableStateFlow("")
+
+    private data class Filters(val albumId: String?, val query: String, val sort: SortOrder)
+
+    private val filters = combine(albumId, query, graph.settings.sortOrder("device", SortOrder.DateNewest)) { a, q, s ->
+        Filters(a, q, s)
+    }
+
+    val state = combine(all, filters, selected, graph.index.sizes) { all, f, selected, sizes ->
         val list = all.orEmpty()
         val albums = graph.media.albumsOf(list)
-        val album = albums.firstOrNull { it.id == albumId }
+        val album = albums.firstOrNull { it.id == f.albumId }
+        val inAlbum = if (album == null) list else list.filter { it.bucketId == album.id }
+        val q = f.query.trim()
+        val matching = if (q.isEmpty()) inAlbum else inAlbum.filter { it.name.contains(q, ignoreCase = true) }
         DeviceUiState(
             loading = all == null,
-            items = sorted(if (album == null) list else list.filter { it.bucketId == album.id }, sort),
+            items = sorted(matching, f.sort),
             albums = albums,
             album = album,
             selected = selected,
             backedUp = sizes,
-            sort = sort,
+            sort = f.sort,
+            query = f.query,
+            albumBacked = list.filter { sizes[it.id] == it.size }.groupingBy { it.bucketId }.eachCount(),
         )
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), DeviceUiState())
+
+    fun setQuery(q: String) {
+        query.value = q
+    }
+
+    /** The selected items, for checking space before backing them up or moving them. */
+    fun selectedItems(): List<MediaItem> = all.value.orEmpty().filter { it.id in selected.value }
+
+    /**
+     * Whether [items] (those not backed up yet) would fit on the NAS. Null if they fit, or if the
+     * free space can't be read; files already on the NAS take no space, so this is an upper bound.
+     */
+    suspend fun spaceShortfall(items: List<MediaItem>): SpaceShortfall? {
+        val sizes = graph.index.sizes.value
+        val needed = items.filter { sizes[it.id] != it.size }.sumOf { it.size }
+        if (needed == 0L || graph.settings.config.first() == null) return null
+        // Don't hold up the tap if the NAS is slow or out of reach (away from home): give up after a
+        // few seconds and just start; the backup itself still only uploads what fits.
+        val lookup = graph.appScope.async { runCatching { graph.nas.space() }.getOrNull() }
+        val space = withTimeoutOrNull(SPACE_CHECK_TIMEOUT_MS) { lookup.await() }?.takeIf { it.total > 0 } ?: return null
+        // The backup keeps a safety margin free, so warn against the same figure.
+        val usable = (space.free - NAS_SPACE_MARGIN).coerceAtLeast(0)
+        return if (needed > usable) SpaceShortfall(needed, usable) else null
+    }
 
     val viewMode = graph.settings.viewMode("device")
         .stateIn(viewModelScope, SharingStarted.Eagerly, ViewMode.Thumbnails)
@@ -352,8 +401,15 @@ class DeviceViewModel(app: Application) : AndroidViewModel(app) {
 
     suspend fun backUpVisible(): Boolean {
         if (graph.settings.config.first() == null) return false
-        val album = state.value.album
-        graph.scheduler.backupNow(if (album == null) BackupScope.All else BackupScope.Album(album.id))
+        val s = state.value
+        graph.scheduler.backupNow(
+            when {
+                // Searching: just the matching files that aren't backed up yet.
+                s.query.isNotBlank() -> BackupScope.Items(s.items.filterNot(s::isBackedUp).map { it.id })
+                s.album == null -> BackupScope.All
+                else -> BackupScope.Album(s.album.id)
+            }
+        )
         return true
     }
 }
@@ -386,6 +442,13 @@ fun DeviceScreen(onOpenSettings: () -> Unit, vm: DeviceViewModel = viewModel()) 
     val scope = rememberCoroutineScope()
     val selecting = state.selected.isNotEmpty()
     BackHandler(enabled = selecting) { vm.clearSelection() }
+    // Search: a field in the top bar that filters by file name as you type.
+    var searching by rememberSaveable { mutableStateOf(false) }
+    fun closeSearch() {
+        searching = false
+        vm.setQuery("")
+    }
+    BackHandler(enabled = searching && !selecting) { closeSearch() }
 
     // Deleting photos the app didn't create needs the user's OK in a system dialog.
     var confirmUnbacked by remember { mutableStateOf(0) }
@@ -433,11 +496,38 @@ fun DeviceScreen(onOpenSettings: () -> Unit, vm: DeviceViewModel = viewModel()) 
         }
     }
 
-    fun startBackup(block: suspend () -> Boolean) = scope.launch {
+    // A backup that won't fit on the NAS asks first; the job then uploads what fits.
+    var lowSpace by remember { mutableStateOf<Pair<SpaceShortfall, suspend () -> Boolean>?>(null) }
+
+    fun runBackup(block: suspend () -> Boolean) = scope.launch {
         if (!block()) {
             val r = snackbar.showSnackbar("Set up your NAS first", actionLabel = "Settings")
             if (r == androidx.compose.material3.SnackbarResult.ActionPerformed) onOpenSettings()
         }
+    }
+
+    /** Starts a backup of [items] via [block], checking first that they'll fit on the NAS. */
+    fun startBackup(items: List<MediaItem>, block: suspend () -> Boolean) = scope.launch {
+        val shortfall = vm.spaceShortfall(items)
+        if (shortfall != null) lowSpace = shortfall to block else runBackup(block)
+    }
+
+    lowSpace?.let { (short, block) ->
+        AlertDialog(
+            onDismissRequest = { lowSpace = null },
+            icon = { Icon(Icons.Filled.Warning, null, tint = MaterialTheme.colorScheme.error) },
+            title = { Text("Not enough space on the NAS") },
+            text = {
+                Text(
+                    "Up to ${formatSize(short.needed)} to back up, but only ${formatSize(short.free)} is free on the NAS. " +
+                        "Files that fit will be backed up; the rest wait until there's room."
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = { lowSpace = null; runBackup(block) }) { Text("Back up what fits") }
+            },
+            dismissButton = { TextButton(onClick = { lowSpace = null }) { Text("Cancel") } },
+        )
     }
 
     if (confirmMove) {
@@ -454,7 +544,7 @@ fun DeviceScreen(onOpenSettings: () -> Unit, vm: DeviceViewModel = viewModel()) 
                 )
             },
             confirmButton = {
-                TextButton(onClick = { confirmMove = false; startBackup(vm::moveSelected) }) { Text("Move") }
+                TextButton(onClick = { confirmMove = false; startBackup(vm.selectedItems(), vm::moveSelected) }) { Text("Move") }
             },
             dismissButton = { TextButton(onClick = { confirmMove = false }) { Text("Cancel") } },
         )
@@ -487,10 +577,18 @@ fun DeviceScreen(onOpenSettings: () -> Unit, vm: DeviceViewModel = viewModel()) 
                             val unbacked = vm.selectedNotBackedUp()
                             if (unbacked > 0) confirmUnbacked = unbacked else startDelete()
                         }) { Icon(Icons.Filled.Delete, "Delete from phone") }
-                        IconButton(onClick = { startBackup(vm::backUpSelected) }) {
+                        IconButton(onClick = { startBackup(vm.selectedItems(), vm::backUpSelected) }) {
                             Icon(Icons.Filled.CloudUpload, "Back up selected")
                         }
                     },
+                )
+            } else if (searching) {
+                FileSearchBar(
+                    query = state.query,
+                    onQueryChange = vm::setQuery,
+                    onClose = ::closeSearch,
+                    hint = "Search file names" + (state.album?.let { " in ${it.name}" } ?: ""),
+                    resultText = if (state.query.isBlank()) null else "${state.items.size} found",
                 )
             } else {
                 TopAppBar(
@@ -506,6 +604,7 @@ fun DeviceScreen(onOpenSettings: () -> Unit, vm: DeviceViewModel = viewModel()) 
                         }
                     },
                     actions = {
+                        IconButton(onClick = { searching = true }) { Icon(Icons.Filled.Search, "Search") }
                         SortMenu(state.sort) { vm.setSort(it) }
                         ViewModeToggle(viewMode, vm::setViewMode)
                     },
@@ -515,7 +614,7 @@ fun DeviceScreen(onOpenSettings: () -> Unit, vm: DeviceViewModel = viewModel()) 
         floatingActionButton = {
             if (granted && !selecting && state.pending > 0) {
                 ExtendedFloatingActionButton(
-                    onClick = { startBackup(vm::backUpVisible) },
+                    onClick = { startBackup(state.items, vm::backUpVisible) },
                     icon = { Icon(Icons.Filled.CloudUpload, null) },
                     text = { Text("Back up ${state.pending}") },
                 )
@@ -613,6 +712,9 @@ fun DeviceScreen(onOpenSettings: () -> Unit, vm: DeviceViewModel = viewModel()) 
     }
 }
 
+/** How long "Back up" waits to read the NAS's free space before starting anyway. */
+private const val SPACE_CHECK_TIMEOUT_MS = 3_000L
+
 /** Android's trash for media (createTrashRequest) arrived in Android 11. */
 fun trashSupported() = Build.VERSION.SDK_INT >= Build.VERSION_CODES.R
 
@@ -648,7 +750,25 @@ private fun AlbumPicker(state: DeviceUiState, onSelect: (String?) -> Unit) {
         DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
             DropdownMenuItem(text = { Text("All photos") }, onClick = { onSelect(null); open = false })
             state.albums.forEach { a ->
-                DropdownMenuItem(text = { Text("${a.name} (${a.count})") }, onClick = { onSelect(a.id); open = false })
+                val backed = state.albumBacked[a.id] ?: 0
+                val percent = if (a.count > 0) backed * 100 / a.count else 0
+                val complete = backed >= a.count
+                DropdownMenuItem(
+                    text = {
+                        Column {
+                            Text("${a.name} (${a.count})")
+                            Text(
+                                if (complete) "All backed up" else "$percent% backed up",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = if (complete) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    },
+                    trailingIcon = {
+                        if (complete) Icon(Icons.Filled.CloudDone, "All backed up", tint = MaterialTheme.colorScheme.primary)
+                    },
+                    onClick = { onSelect(a.id); open = false },
+                )
             }
         }
     }
@@ -659,7 +779,10 @@ private fun AlbumPicker(state: DeviceUiState, onSelect: (String?) -> Unit) {
 private fun MediaGrid(state: DeviceUiState, onClick: (MediaItem) -> Unit, onLongClick: (MediaItem) -> Unit) {
     val context = LocalContext.current
     val groups = remember(state.items, state.sort) { monthGroups(state.items, state.sort.byDate) }
+    val gridState = rememberLazyGridState()
+    Box(Modifier.fillMaxSize()) {
     LazyVerticalGrid(
+        state = gridState,
         columns = GridCells.Adaptive(110.dp),
         contentPadding = PaddingValues(2.dp, 2.dp, 2.dp, 88.dp),
         horizontalArrangement = Arrangement.spacedBy(2.dp),
@@ -708,7 +831,17 @@ private fun MediaGrid(state: DeviceUiState, onClick: (MediaItem) -> Unit, onLong
         }
         }
     }
+    GridScrollbar(gridState) { f -> devicePosition(state, f) }
+    }
 }
+
+/** Scrollbar bubble for the Device tab: month, letter or size, following the sort. */
+private fun devicePosition(state: DeviceUiState, fraction: Float): String? = positionLabel(
+    state.items, fraction,
+    sortByDate = state.sort.byDate,
+    sortByName = state.sort == SortOrder.NameAZ || state.sort == SortOrder.NameZA,
+    name = { it.name }, date = { it.takenAt }, size = { it.size },
+)
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
@@ -720,7 +853,9 @@ private fun MediaList(
 ) {
     val context = LocalContext.current
     val groups = remember(state.items, state.sort) { monthGroups(state.items, state.sort.byDate) }
-    LazyColumn(contentPadding = PaddingValues(bottom = 88.dp), modifier = Modifier.fillMaxSize()) {
+    val listState = rememberLazyListState()
+    Box(Modifier.fillMaxSize()) {
+    LazyColumn(state = listState, contentPadding = PaddingValues(bottom = 88.dp), modifier = Modifier.fillMaxSize()) {
         groups.forEach { (month, list) ->
         if (month != null) stickyHeader(key = "month-$month") { MonthHeader(month, list.size) }
         items(list, key = { it.id }) { item ->
@@ -767,6 +902,8 @@ private fun MediaList(
             )
         }
         }
+    }
+    ListScrollbar(listState) { f -> devicePosition(state, f) }
     }
 }
 

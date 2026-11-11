@@ -26,6 +26,9 @@ import java.io.FileNotFoundException
 import java.io.InputStream
 import kotlin.math.abs
 
+/** Room kept free on the NAS, so a backup never fills it to the last byte. */
+const val NAS_SPACE_MARGIN = 200L * 1024 * 1024
+
 /**
  * Copies media to the NAS as <destination>/<phone folder>/<name>, e.g. Backups/DCIM/Camera/IMG_1.jpg.
  * Runs are serialized, so a manual backup and the scheduled one never upload the same file
@@ -75,7 +78,13 @@ class BackupEngine(
         val bytesUploaded: Long = 0,
         /** "file: reason" for each failure, for the history (capped). */
         val errors: List<String> = emptyList(),
+        /** Files not uploaded because the NAS didn't have room, and their total size. */
+        val noSpace: Int = 0,
+        val noSpaceBytes: Long = 0,
     )
+
+    /** Thrown instead of uploading a file that doesn't fit in the NAS's free space. */
+    private class NoSpaceException : Exception("Not enough space on the NAS")
 
     /** Result of "Check backups". */
     data class CheckReport(
@@ -151,8 +160,38 @@ class BackupEngine(
         private val total: Int,
         /** Sum of all pending files' sizes, so the job bar can move by bytes, not by file count. */
         private val totalBytes: Long,
+        /** Free space on the NAS (minus a safety margin), or null if it's unknown. */
+        private var spaceLeft: Long?,
         private val onProgress: suspend (Progress) -> Unit,
     ) {
+        var noSpace = 0
+        var noSpaceBytes = 0L
+
+        /**
+         * Reserves room for [item] before uploading it. False if it doesn't fit; the file is
+         * then only checked against the NAS (an identical copy may already be there), not sent.
+         */
+        suspend fun reserve(item: MediaItem): Boolean = mutex.withLock {
+            val left = spaceLeft ?: return@withLock true
+            if (item.size > left) return@withLock false
+            spaceLeft = left - item.size
+            true
+        }
+
+        /** Gives back a reservation that wasn't used (already there, failed, gone). */
+        suspend fun refund(item: MediaItem) = mutex.withLock {
+            spaceLeft = spaceLeft?.plus(item.size)
+        }
+
+        suspend fun leftOutForSpace(item: MediaItem) = mutex.withLock {
+            inFlight.remove(item.id)
+            processedBytes += item.size
+            done++
+            noSpace++
+            noSpaceBytes += item.size
+            report(force = true)
+        }
+
         /** Bytes of files already finished, skipped or failed (whole file sizes). */
         private var processedBytes = 0L
         private val mutex = Mutex()
@@ -258,7 +297,11 @@ class BackupEngine(
         onProgress: suspend (Progress) -> Unit,
     ): Summary = coroutineScope {
         val parallel = settings.prefs.first().parallelUploads.coerceIn(1, 4)
-        val run = UploadRun(pending.size, pending.sumOf { it.size }, onProgress)
+        // Upload only what fits: rather than failing with "disk full" halfway through a file,
+        // files that won't fit are left for a later run.
+        val space = if (pending.isEmpty()) null else runCatching { nas.space() }.getOrNull()
+        val budget = space?.takeIf { it.total > 0 }?.let { (it.free - NAS_SPACE_MARGIN).coerceAtLeast(0) }
+        val run = UploadRun(pending.size, pending.sumOf { it.size }, budget, onProgress)
         val queue = Channel<MediaItem>(Channel.UNLIMITED)
         pending.forEach { queue.trySend(it) }
         queue.close()
@@ -268,27 +311,33 @@ class BackupEngine(
                 for (item in queue) {
                     if (run.aborted) break
                     run.start(item)
+                    val reserved = run.reserve(item)
                     var fileSent = 0L
                     try {
                         // The block re-opens the input itself, so NasClient's reconnect-and-retry is safe.
                         val sent = nas.withShare { share ->
                             run.restart(item, fileSent)
                             fileSent = 0
-                            backupOne(share, config, item, cache, overwrite[item.id]) { s ->
+                            backupOne(share, config, item, cache, overwrite[item.id], canUpload = reserved) { s ->
                                 val previous = fileSent
                                 fileSent = s
                                 run.bytes(item, s, previous)
                             }
                         }
+                        if (reserved && !sent) run.refund(item) // already there: took no space
                         run.finished(item, sent)
                     } catch (e: CancellationException) {
                         throw e
                     } catch (e: NasNotConfiguredException) {
                         throw e
+                    } catch (e: NoSpaceException) {
+                        run.leftOutForSpace(item)
                     } catch (e: FileNotFoundException) {
                         // Deleted from the phone since the list was loaded; nothing to back up.
+                        if (reserved) run.refund(item)
                         run.skipped(item)
                     } catch (e: Exception) {
+                        if (reserved) run.refund(item)
                         run.failed(item, "${item.name}: ${NasClient.describe(e)}")
                     }
                 }
@@ -304,6 +353,8 @@ class BackupEngine(
             lastError = run.lastError,
             bytesUploaded = run.runBytes,
             errors = run.errors.toList(),
+            noSpace = run.noSpace,
+            noSpaceBytes = run.noSpaceBytes,
         )
     }
 
@@ -316,9 +367,11 @@ class BackupEngine(
         item: MediaItem,
         cache: FolderCache,
         overwritePath: String?,
+        canUpload: Boolean = true,
         onBytes: suspend (Long) -> Unit,
     ): Boolean {
         if (overwritePath != null) {
+            if (!canUpload) throw NoSpaceException()
             // Full check found this copy damaged: replace it in place.
             val dir = NasPath.parent(overwritePath)
             cache.ensureDir(share, dir)
@@ -332,23 +385,27 @@ class BackupEngine(
         val dir = remoteDir(config, item)
         val files = cache.files(share, dir)
         val safe = NasPath.safeName(item.name)
-        val stem = safe.substringBeforeLast('.')
-        val ext = safe.substringAfterLast('.', "")
         // The plain name first; if a different file already has it (IMG_0001.jpg from another
         // phone, or an older edit), this one is kept alongside, tagged with its media id.
-        val candidates = listOf(safe, if (ext.isEmpty()) "${stem}_${item.id}" else "${stem}_${item.id}.$ext")
+        val candidates = listOf(safe, taggedName(safe, item.id))
 
         for ((n, name) in candidates.withIndex()) {
             val path = NasPath.join(dir, name)
             val remote = files[name.lowercase()]
             when {
-                remote == null -> return upload(share, item, dir, path, replace = false, cache, onBytes)
+                remote == null -> {
+                    if (!canUpload) throw NoSpaceException()
+                    return upload(share, item, dir, path, replace = false, cache, onBytes)
+                }
                 isSameFile(share, item, path, remote) -> {
                     index.mark(item.id, path, item.size)
                     return false
                 }
                 // The id-tagged name is this media's own slot: replace the outdated copy.
-                n == candidates.lastIndex -> return upload(share, item, dir, path, replace = true, cache, onBytes)
+                n == candidates.lastIndex -> {
+                    if (!canUpload) throw NoSpaceException()
+                    return upload(share, item, dir, path, replace = true, cache, onBytes)
+                }
             }
         }
         error("unreachable")
@@ -395,6 +452,7 @@ class BackupEngine(
         if (toCheck.isEmpty()) return emptyList()
         val destination = NasPath.clean(config.destination).lowercase()
         val gone = ArrayList<Long>()
+        val alreadyFixed = if (fixDates) index.datesFixed() else emptySet()
         // Copies whose NAS dates don't match the phone (uploaded before dates were copied).
         val wrongDates = ArrayList<Pair<MediaItem, String>>()
         nas.withShare { share ->
@@ -406,7 +464,7 @@ class BackupEngine(
                 val inDestination = destination.isEmpty() || path.lowercase().startsWith("$destination\\")
                 val remote = cache.files(share, NasPath.parent(path))[NasPath.name(path).lowercase()]
                 if (!inDestination || remote?.size != item.size) gone += item.id
-                else if (fixDates && remote != null &&
+                else if (fixDates && remote != null && item.id !in alreadyFixed &&
                     (offBy(remote.modifiedAt, item.modifiedAt) || offBy(remote.createdAt, item.takenAt))
                 ) {
                     wrongDates += item to path
@@ -426,6 +484,8 @@ class BackupEngine(
                     }
                 }
             }
+            // Tried once; if the server doesn't keep these dates, don't retry every backup.
+            index.markDatesFixed(wrongDates.map { it.first.id })
         }
         return gone
     }
@@ -456,7 +516,7 @@ class BackupEngine(
         // matching size and time means it's there (e.g. after Reset history); re-record it.
         // Anything not found isn't on the NAS: deleted there, or never backed up.
         val notBackedUp = ArrayList<MediaItem>()
-        val refound = ArrayList<MediaItem>()
+        val refound = ArrayList<Pair<MediaItem, String>>()
         nas.withShare { share ->
             notBackedUp.clear()
             refound.clear()
@@ -464,18 +524,23 @@ class BackupEngine(
                 currentCoroutineContext().ensureActive()
                 if (index.isBackedUp(item)) continue
                 val dir = remoteDir(config, item)
-                val name = NasPath.safeName(item.name)
-                val remote = cache.files(share, dir)[name.lowercase()]
-                val same = remote != null && remote.size == item.size &&
-                    item.modifiedAt > 0 && abs(remote.modifiedAt - item.modifiedAt) <= TIME_TOLERANCE_MS
-                if (same) refound += item else notBackedUp += item
+                val files = cache.files(share, dir)
+                val safe = NasPath.safeName(item.name)
+                // The plain name counts if size and time match; the id-tagged name is this
+                // photo's own slot, so the size is enough.
+                val plain = files[safe.lowercase()]?.takeIf {
+                    it.size == item.size && item.modifiedAt > 0 && abs(it.modifiedAt - item.modifiedAt) <= TIME_TOLERANCE_MS
+                }
+                val tagged = files[taggedName(safe, item.id).lowercase()]?.takeIf { it.size == item.size }
+                val found = plain ?: tagged
+                if (found != null) refound += item to NasPath.join(dir, found.name) else notBackedUp += item
             }
         }
-        refound.forEach { index.mark(it.id, NasPath.join(remoteDir(config, it), NasPath.safeName(it.name)), it.size) }
+        refound.forEach { (item, path) -> index.mark(item.id, path, item.size) }
 
         // 1. Presence and size, from one listing per folder.
         val missingIds = forgetMissing(config, marked, cache).toHashSet()
-        val present = marked.filter { it.id !in missingIds } + refound
+        val present = marked.filter { it.id !in missingIds } + refound.map { it.first }
 
         // 2. Content, file by file (full only).
         val damaged = HashMap<Long, String>() // id -> path of the bad copy
@@ -504,7 +569,7 @@ class BackupEngine(
             index.markDamaged(damaged)
         } else {
             matched = present.size
-            onProgress(Progress(marked.size, marked.size, 0, null, phase = Phase.Check))
+            onProgress(Progress(items.size, items.size, 0, null, phase = Phase.Check))
         }
 
         // 3. Repair: upload what's missing, replace what's damaged.
@@ -513,10 +578,12 @@ class BackupEngine(
         var aborted = false
         var lastError: String? = null
         var repairErrors: List<String> = emptyList()
+        var foundOnRepair = 0
         if (repair && (missingIds.isNotEmpty() || damaged.isNotEmpty() || notBackedUp.isNotEmpty())) {
             val toFix = marked.filter { it.id in missingIds || it.id in damaged } + notBackedUp
             val s = uploadAll(config, toFix, cache, overwrite = index.damaged(), onProgress = onProgress)
-            repaired = s.uploaded + s.alreadyThere
+            repaired = s.uploaded
+            foundOnRepair = s.alreadyThere
             repairFailed = s.failed
             aborted = s.aborted
             lastError = s.lastError
@@ -526,12 +593,13 @@ class BackupEngine(
         CheckReport(
             // Every phone file in scope was compared with the NAS one way or another.
             checked = items.size,
-            ok = matched,
-            missing = missingIds.size,
+            // Files the repair found already there (matched by content) were fine after all.
+            ok = matched + foundOnRepair,
+            missing = (missingIds.size - (foundOnRepair - minOf(foundOnRepair, notBackedUp.size))).coerceAtLeast(0),
             different = damaged.size,
             unreadable = unreadable,
             skipped = present.size - matched - damaged.size - unreadable,
-            notBackedUp = notBackedUp.size,
+            notBackedUp = notBackedUp.size - minOf(foundOnRepair, notBackedUp.size),
             repaired = repaired,
             repairFailed = repairFailed,
             aborted = aborted,
@@ -633,6 +701,13 @@ class BackupEngine(
             ?: throw FileNotFoundException(item.uri.toString())
     }
 
+    /** "IMG_0001_123.jpg": the name used when a different file already has the plain one. */
+    private fun taggedName(safe: String, id: Long): String {
+        val stem = safe.substringBeforeLast('.')
+        val ext = safe.substringAfterLast('.', "")
+        return if (ext.isEmpty()) "${stem}_$id" else "${stem}_$id.$ext"
+    }
+
     /** True if two times differ by more than the NAS can store precisely (unknown phone times are ignored). */
     private fun offBy(remote: Long, phone: Long) = phone > 0 && abs(remote - phone) > TIME_TOLERANCE_MS
 
@@ -645,6 +720,7 @@ class BackupEngine(
     private companion object {
         const val MAX_CONSECUTIVE_FAILURES = 3
         const val MAX_ERRORS_KEPT = 50
+
         const val PROGRESS_INTERVAL_MS = 300L
         /** SMB servers store times at 100 ns to 2 s precision (FAT-style), so allow a little slack. */
         const val TIME_TOLERANCE_MS = 2_000L

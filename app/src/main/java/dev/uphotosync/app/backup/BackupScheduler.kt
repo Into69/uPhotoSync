@@ -180,6 +180,26 @@ class BackupScheduler(private val context: Context) {
         wm.enqueue(request)
     }
 
+    /**
+     * Saves many NAS files to the phone as one background job (e.g. whole folders). It shows up
+     * alongside single downloads on the NAS tab.
+     */
+    fun restoreBatch(entries: List<NasEntry>) {
+        if (entries.isEmpty()) return
+        // The list can be thousands of files; WorkManager input is capped at 10 KB, so use a file.
+        val file = File(selectionDir(context), "restore-" + UUID.randomUUID())
+        file.writeText(entries.joinToString("\n") { "${it.path}\t${it.size}\t${it.modifiedAt}" })
+        val n = entries.size
+        val request = OneTimeWorkRequestBuilder<RestoreWorker>()
+            .setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build())
+            .setExpedited(OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
+            .setInputData(workDataOf(RestoreWorker.KEY_LIST_FILE to file.absolutePath))
+            .addTag(DownloadWorker.TAG)
+            .addTag(DownloadWorker.TAG_FILE_PREFIX + "$n ${if (n == 1) "file" else "files"}")
+            .build()
+        wm.enqueue(request)
+    }
+
     val downloads: Flow<List<WorkInfo>> = wm.getWorkInfosByTagFlow(DownloadWorker.TAG)
 
     val workInfos: Flow<List<WorkInfo>> = wm.getWorkInfosByTagFlow(TAG)

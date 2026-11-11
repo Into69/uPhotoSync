@@ -28,12 +28,24 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.grid.rememberLazyGridState
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material3.ListItem
+import dev.uphotosync.app.data.PhoneStorage
 import dev.uphotosync.app.data.SortOrder
+import dev.uphotosync.app.backup.RestoreWorker
+import androidx.compose.material.icons.filled.Download
+import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.Warning
+import androidx.compose.runtime.saveable.rememberSaveable
 import dev.uphotosync.app.data.StorageSpace
 import dev.uphotosync.app.data.ViewMode
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.repeatOnLifecycle
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.stateIn
 import androidx.compose.material.icons.Icons
@@ -111,7 +123,27 @@ data class NasUiState(
     /** Paths selected with a long-press, for deleting. */
     val selected: Set<String> = emptySet(),
     val deleting: Boolean = false,
-)
+    /** File-name search within this folder; blank shows everything. */
+    val query: String = "",
+    /** Working out what to save to the phone (listing folders). */
+    val preparingRestore: Boolean = false,
+) {
+    /** What's on screen: the folder's entries, narrowed by the search. */
+    val shown: List<NasEntry>
+        get() = query.trim().let { q -> if (q.isEmpty()) entries else entries.filter { it.name.contains(q, ignoreCase = true) } }
+}
+
+/** What "Save to phone" will do with a selection, shown for confirmation. */
+data class RestorePlan(
+    val files: List<NasEntry>,
+    /** Photos and videos left out because they're already on the phone. */
+    val alreadyOnPhone: Int,
+    val bytes: Long,
+    /** Phone free space, if known. */
+    val phoneFree: Long?,
+) {
+    val tooBig get() = phoneFree != null && bytes > phoneFree
+}
 
 class NasViewModel(app: Application) : AndroidViewModel(app) {
     private val graph = (app as PhotoSyncApp).graph
@@ -174,7 +206,7 @@ class NasViewModel(app: Application) : AndroidViewModel(app) {
         // Stop filling in the previous folder's thumbnails (one already downloading still finishes).
         prefetchJob?.cancel()
         _state.update {
-            it.copy(path = NasPath.clean(path), loading = true, error = null, configured = true, selected = emptySet())
+            it.copy(path = NasPath.clean(path), loading = true, error = null, configured = true, selected = emptySet(), query = "")
         }
         loadJob = viewModelScope.launch {
             try {
@@ -204,9 +236,20 @@ class NasViewModel(app: Application) : AndroidViewModel(app) {
     /** The share's size and free space, refreshed when a folder loads (and after deletes). */
     val space = _space.asStateFlow()
 
-    private fun refreshSpace() = viewModelScope.launch {
-        // Not every server reports it; leave the line hidden if it doesn't.
-        runCatching { graph.nas.space() }.onSuccess { _space.value = it }
+    private var spaceJob: Job? = null
+
+    /**
+     * Re-reads the share's size and free space. Called on folder load, on Refresh, and every
+     * [SPACE_REFRESH_MS] while the tab is on screen. One request at a time; skipped until the
+     * NAS is set up.
+     */
+    fun refreshSpace() {
+        if (spaceJob?.isActive == true) return
+        spaceJob = viewModelScope.launch {
+            if (graph.settings.config.first() == null) return@launch
+            // Not every server reports it; keep the last known numbers (or none) if it doesn't.
+            runCatching { graph.nas.space() }.onSuccess { _space.value = it }
+        }
     }
 
     /**
@@ -228,13 +271,51 @@ class NasViewModel(app: Application) : AndroidViewModel(app) {
         return true
     }
 
-    fun refresh() = open(_state.value.path)
+    fun refresh() {
+        open(_state.value.path)
+        // Separately from the listing, so it updates even if the folder can't be read.
+        refreshSpace()
+    }
 
     fun toggle(path: String) = _state.update {
         it.copy(selected = if (path in it.selected) it.selected - path else it.selected + path)
     }
 
-    fun selectAll() = _state.update { s -> s.copy(selected = s.entries.mapTo(HashSet()) { it.path }) }
+    fun selectAll() = _state.update { s -> s.copy(selected = s.shown.mapTo(HashSet()) { it.path }) }
+
+    fun setQuery(q: String) = _state.update { it.copy(query = q) }
+
+    /**
+     * Works out what saving [entries] to the phone involves: every photo and video inside them
+     * (folders all the way down), minus ones already on the phone, and whether it fits.
+     */
+    fun planRestore(entries: List<NasEntry>, onReady: (RestorePlan) -> Unit) {
+        if (_state.value.preparingRestore) return
+        _state.update { it.copy(preparingRestore = true) }
+        viewModelScope.launch {
+            val result = runCatching {
+                val found = graph.nas.listMediaRecursive(entries)
+                // NAS copies of photos still on the phone (recorded by backups or earlier restores).
+                val onPhone = withContext(Dispatchers.IO) {
+                    val ids = graph.media.loadAll().mapTo(HashSet()) { it.id }
+                    graph.index.entries().filterKeys { it in ids }.values.mapTo(HashSet()) { it.first.lowercase() }
+                }
+                val toSave = found.filter { it.path.lowercase() !in onPhone }
+                val free = withContext(Dispatchers.IO) { PhoneStorage.read(getApplication())?.free }
+                RestorePlan(toSave, found.size - toSave.size, toSave.sumOf { it.size }, free)
+            }
+            _state.update { it.copy(preparingRestore = false) }
+            result
+                .onSuccess(onReady)
+                .onFailure { e -> messages.tryEmit("Couldn't list the files: ${NasClient.describe(e)}") }
+        }
+    }
+
+    fun restore(plan: RestorePlan) {
+        graph.scheduler.restoreBatch(plan.files)
+        clearSelection()
+        messages.tryEmit("Saving ${plan.files.size} ${if (plan.files.size == 1) "file" else "files"} to the phone…")
+    }
 
     fun clearSelection() = _state.update { it.copy(selected = emptySet()) }
 
@@ -290,9 +371,14 @@ class NasViewModel(app: Application) : AndroidViewModel(app) {
                 val rate = running?.progress?.getLong(DownloadWorker.KEY_RATE, 0) ?: 0
                 _state.update {
                     it.copy(
-                        downloading = when (active.size) {
-                            0 -> null
-                            1 -> fileName(active[0])
+                        downloading = when {
+                            active.isEmpty() -> null
+                            running != null && running.progress.getInt(RestoreWorker.KEY_TOTAL, 0) > 0 -> {
+                                val p = running.progress
+                                "${p.getInt(RestoreWorker.KEY_DONE, 0) + 1} of ${p.getInt(RestoreWorker.KEY_TOTAL, 0)}: " +
+                                    (p.getString(RestoreWorker.KEY_CURRENT) ?: "")
+                            }
+                            active.size == 1 -> fileName(active[0])
                             else -> "${active.size} files"
                         },
                         downloadProgress = if (size > 0) (bytes.toFloat() / size).coerceIn(0f, 1f) else null,
@@ -306,7 +392,8 @@ class NasViewModel(app: Application) : AndroidViewModel(app) {
                         val name = fileName(info)
                         messages.tryEmit(
                             when (info.state) {
-                                WorkInfo.State.SUCCEEDED -> "Saved $name to the gallery"
+                                WorkInfo.State.SUCCEEDED -> "Saved ${info.outputData.getString(DownloadWorker.KEY_NAME) ?: name} to the gallery" +
+                                    (info.outputData.getString(DownloadWorker.KEY_ERROR)?.let { " ($it)" } ?: "")
                                 WorkInfo.State.CANCELLED -> "Cancelled saving $name"
                                 else -> "Couldn't save $name: " +
                                     (info.outputData.getString(DownloadWorker.KEY_ERROR) ?: "unknown error")
@@ -332,10 +419,27 @@ fun NasScreen(onOpenSettings: () -> Unit, vm: NasViewModel = viewModel()) {
     val snackbar = remember { SnackbarHostState() }
     var preview by remember { mutableStateOf<NasEntry?>(null) }
     var confirmDelete by remember { mutableStateOf<List<NasEntry>?>(null) }
+    var restorePlan by remember { mutableStateOf<RestorePlan?>(null) }
+    var searching by rememberSaveable { mutableStateOf(false) }
+    fun closeSearch() {
+        searching = false
+        vm.setQuery("")
+    }
     val selecting = state.selected.isNotEmpty()
     LaunchedEffect(Unit) { vm.start() }
+    // Keep the disk space current while this tab is on screen (stops when it isn't).
+    val lifecycle = LocalLifecycleOwner.current.lifecycle
+    LaunchedEffect(lifecycle) {
+        lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) {
+            while (true) {
+                vm.refreshSpace()
+                delay(SPACE_REFRESH_MS)
+            }
+        }
+    }
     LaunchedEffect(Unit) { vm.messages.collect { snackbar.showSnackbar(it) } }
-    BackHandler(enabled = state.path.isNotEmpty() && !selecting) { vm.up() }
+    BackHandler(enabled = state.path.isNotEmpty() && !selecting && !searching) { vm.up() }
+    BackHandler(enabled = searching && !selecting) { closeSearch() }
     BackHandler(enabled = selecting) { vm.clearSelection() }
 
     Scaffold(
@@ -349,10 +453,22 @@ fun NasScreen(onOpenSettings: () -> Unit, vm: NasViewModel = viewModel()) {
                     actions = {
                         IconButton(onClick = vm::selectAll) { Icon(Icons.Filled.SelectAll, "Select all") }
                         IconButton(
+                            onClick = { vm.planRestore(state.entries.filter { it.path in state.selected }) { restorePlan = it } },
+                            enabled = !state.preparingRestore,
+                        ) { Icon(Icons.Filled.Download, "Save to phone") }
+                        IconButton(
                             onClick = { confirmDelete = state.entries.filter { it.path in state.selected } },
                             enabled = !state.deleting,
                         ) { Icon(Icons.Filled.Delete, "Delete from NAS") }
                     },
+                )
+            } else if (searching) {
+                FileSearchBar(
+                    query = state.query,
+                    onQueryChange = vm::setQuery,
+                    onClose = ::closeSearch,
+                    hint = "Search " + (NasPath.name(state.path).ifEmpty { "this folder" }),
+                    resultText = if (state.query.isBlank()) null else "${state.shown.size} found in this folder",
                 )
             } else TopAppBar(
                 navigationIcon = {
@@ -370,6 +486,7 @@ fun NasScreen(onOpenSettings: () -> Unit, vm: NasViewModel = viewModel()) {
                     }
                 },
                 actions = {
+                    IconButton(onClick = { searching = true }) { Icon(Icons.Filled.Search, "Search this folder") }
                     val sort by vm.sort.collectAsStateWithLifecycle()
                     SortMenu(sort) { vm.setSort(it) }
                     ViewModeToggle(viewMode, vm::setViewMode)
@@ -384,7 +501,7 @@ fun NasScreen(onOpenSettings: () -> Unit, vm: NasViewModel = viewModel()) {
             if (state.configured) StorageLine("NAS", space, isNas = true)
             val progress = state.downloadProgress
             when {
-                state.deleting -> LinearProgressIndicator(Modifier.fillMaxWidth())
+                state.deleting || state.preparingRestore -> LinearProgressIndicator(Modifier.fillMaxWidth())
                 state.downloading != null && progress != null ->
                     LinearProgressIndicator(progress = { progress }, modifier = Modifier.fillMaxWidth())
                 state.loading || state.downloading != null -> LinearProgressIndicator(Modifier.fillMaxWidth())
@@ -415,6 +532,7 @@ fun NasScreen(onOpenSettings: () -> Unit, vm: NasViewModel = viewModel()) {
                     Button(onClick = vm::refresh, modifier = Modifier.padding(top = 16.dp)) { Text("Retry") }
                 }
                 !state.loading && state.entries.isEmpty() -> CenterText("This folder is empty")
+                !state.loading && state.shown.isEmpty() -> CenterText("Nothing in this folder matches \"${state.query.trim()}\"")
                 else -> {
                     val onOpen: (NasEntry) -> Unit = { e ->
                         when {
@@ -424,9 +542,21 @@ fun NasScreen(onOpenSettings: () -> Unit, vm: NasViewModel = viewModel()) {
                         }
                     }
                     val onSelect: (NasEntry) -> Unit = { vm.toggle(it.path) }
-                    when (viewMode) {
-                        ViewMode.Thumbnails -> NasGrid(state.entries, state.selected, onOpen, onSelect)
-                        ViewMode.Details -> NasList(state.entries, state.selected, onOpen, onSelect)
+                    run {
+                        val sortNow by vm.sort.collectAsStateWithLifecycle()
+                        // Scrollbar bubble: month, letter or size, following the sort.
+                        val position: (Float) -> String? = { f ->
+                            positionLabel(
+                                state.shown, f,
+                                sortByDate = sortNow.byDate,
+                                sortByName = sortNow == SortOrder.NameAZ || sortNow == SortOrder.NameZA,
+                                name = { it.name }, date = { it.modifiedAt }, size = { it.size },
+                            )
+                        }
+                        when (viewMode) {
+                            ViewMode.Thumbnails -> NasGrid(state.shown, state.selected, onOpen, onSelect, position)
+                            ViewMode.Details -> NasList(state.shown, state.selected, onOpen, onSelect, position)
+                        }
                     }
                 }
             }
@@ -435,7 +565,7 @@ fun NasScreen(onOpenSettings: () -> Unit, vm: NasViewModel = viewModel()) {
 
     preview?.let { e ->
         // Swipe through the photos and videos in this folder.
-        val media = remember(state.entries) { state.entries.filter { it.isImage || it.isVideo } }
+        val media = remember(state.shown) { state.shown.filter { it.isImage || it.isVideo } }
         val viewerItems = remember(media) {
             media.map {
                 ViewerItem(
@@ -462,6 +592,43 @@ fun NasScreen(onOpenSettings: () -> Unit, vm: NasViewModel = viewModel()) {
                 }
             }
         }
+    }
+
+    restorePlan?.let { plan ->
+        val n = plan.files.size
+        AlertDialog(
+            onDismissRequest = { restorePlan = null },
+            icon = { Icon(if (plan.tooBig) Icons.Filled.Warning else Icons.Filled.Download, null) },
+            title = {
+                Text(
+                    if (n == 0) "Nothing to save"
+                    else "Save $n ${if (n == 1) "photo or video" else "photos and videos"} to the phone?"
+                )
+            },
+            text = {
+                Text(
+                    buildString {
+                        if (n > 0) {
+                            append("${formatSize(plan.bytes)} in total. They go back into their original phone folders where possible. ")
+                        }
+                        if (plan.alreadyOnPhone > 0) {
+                            append("${plan.alreadyOnPhone} already on the phone ${if (plan.alreadyOnPhone == 1) "is" else "are"} skipped. ")
+                        }
+                        if (plan.tooBig) {
+                            append("\n\nThe phone only has ${formatSize(plan.phoneFree ?: 0)} free, so not everything will fit.")
+                        }
+                    }.trim()
+                )
+            },
+            confirmButton = {
+                if (n > 0) {
+                    TextButton(onClick = { vm.restore(plan); restorePlan = null }) {
+                        Text(if (plan.tooBig) "Save anyway" else "Save")
+                    }
+                }
+            },
+            dismissButton = { TextButton(onClick = { restorePlan = null }) { Text(if (n > 0) "Cancel" else "OK") } },
+        )
     }
 
     confirmDelete?.let { targets ->
@@ -511,9 +678,13 @@ private fun NasGrid(
     selected: Set<String>,
     onOpen: (NasEntry) -> Unit,
     onSelect: (NasEntry) -> Unit,
+    position: (Float) -> String?,
 ) {
     val context = LocalContext.current
+    val gridState = rememberLazyGridState()
+    Box(Modifier.fillMaxSize()) {
     LazyVerticalGrid(
+        state = gridState,
         columns = GridCells.Adaptive(110.dp),
         contentPadding = PaddingValues(4.dp),
         horizontalArrangement = Arrangement.spacedBy(4.dp),
@@ -574,6 +745,8 @@ private fun NasGrid(
             }
         }
     }
+    GridScrollbar(gridState, position)
+    }
 }
 
 @OptIn(ExperimentalFoundationApi::class)
@@ -583,9 +756,12 @@ private fun NasList(
     selected: Set<String>,
     onOpen: (NasEntry) -> Unit,
     onSelect: (NasEntry) -> Unit,
+    position: (Float) -> String?,
 ) {
     val context = LocalContext.current
-    LazyColumn(Modifier.fillMaxSize()) {
+    val listState = rememberLazyListState()
+    Box(Modifier.fillMaxSize()) {
+    LazyColumn(Modifier.fillMaxSize(), state = listState) {
         items(entries, key = { it.path }) { e ->
             val isSelected = e.path in selected
             ListItem(
@@ -631,7 +807,12 @@ private fun NasList(
             )
         }
     }
+    ListScrollbar(listState, position)
+    }
 }
+
+/** How often the NAS disk space refreshes while the NAS tab is open. */
+private const val SPACE_REFRESH_MS = 60_000L
 
 private const val MAX_THUMB_BYTES = 40L * 1024 * 1024
 

@@ -19,6 +19,7 @@ import dev.uphotosync.app.smb.NasClient
 import dev.uphotosync.app.smb.NasNotConfiguredException
 import dev.uphotosync.app.ui.MainActivity
 import dev.uphotosync.app.ui.Tab
+import dev.uphotosync.app.ui.formatSize
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.flow.first
@@ -113,7 +114,9 @@ class BackupWorker(context: Context, params: WorkerParameters) : CoroutineWorker
                 record(
                     outcome = when {
                         report.aborted || report.repairFailed > 0 -> Outcome.Partial
-                        report.missing + report.different + report.unreadable > 0 && report.repaired == 0 -> Outcome.Partial
+                        // Problems found and not (all) fixed.
+                        report.missing + report.notBackedUp + report.different + report.unreadable > report.repaired ->
+                            Outcome.Partial
                         else -> Outcome.Success
                     },
                     summary = text,
@@ -146,6 +149,7 @@ class BackupWorker(context: Context, params: WorkerParameters) : CoroutineWorker
                 KEY_ERROR to summary.lastError,
                 KEY_MOVE_READY to moveReady,
                 KEY_MOVE_KEPT to moveKept,
+                KEY_NO_SPACE to summary.noSpace,
             )
             val willRetry = summary.aborted && runAttemptCount < 3
             if (scheduled) reportSummary(summary, System.currentTimeMillis() - startedAt, willRetry)
@@ -160,13 +164,14 @@ class BackupWorker(context: Context, params: WorkerParameters) : CoroutineWorker
                 record(
                     outcome = when {
                         summary.aborted -> Outcome.Failed
-                        summary.failed > 0 || moveKept > 0 -> Outcome.Partial
+                        summary.failed > 0 || moveKept > 0 || summary.noSpace > 0 -> Outcome.Partial
                         else -> Outcome.Success
                     },
                     summary = buildList {
                         add("${summary.uploaded} uploaded")
                         if (summary.alreadyThere > 0) add("${summary.alreadyThere} already on the NAS")
                         if (summary.failed > 0) add("${summary.failed} failed")
+                        if (summary.noSpace > 0) add(noSpaceNote(summary))
                         if (move) add("$moveReady verified for deleting from the phone")
                         if (moveKept > 0) add("$moveKept kept on the phone")
                         if (summary.aborted) add(if (willRetry) "stopped, will retry" else "stopped")
@@ -310,6 +315,8 @@ class BackupWorker(context: Context, params: WorkerParameters) : CoroutineWorker
                 "Stopped after ${s.uploaded} uploaded: ${s.lastError ?: "the NAS stopped responding"}"
             s.aborted -> "Scheduled backup failed" to
                 "${s.uploaded} uploaded before it stopped: ${s.lastError ?: "the NAS stopped responding"}"
+            s.noSpace > 0 -> "Scheduled backup: the NAS is nearly full" to
+                "${s.uploaded} uploaded; " + noSpaceNote(s) + ". Free up space on the NAS."
             s.failed > 0 -> "Scheduled backup finished with errors" to
                 "${s.uploaded} uploaded, ${s.failed} failed in $took. Last error: ${s.lastError}"
             s.uploaded > 0 -> "Scheduled backup complete" to
@@ -350,6 +357,9 @@ class BackupWorker(context: Context, params: WorkerParameters) : CoroutineWorker
         return "$kind: $problems ${if (problems == 1) "problem" else "problems"} found" to
             "Checked ${r.checked}: ${r.ok} OK, $found.$fix"
     }
+
+    private fun noSpaceNote(s: BackupEngine.Summary) =
+        "${s.noSpace} (${formatSize(s.noSpaceBytes)}) not backed up: not enough space on the NAS"
 
     private fun reportMove(ready: Int, kept: Int) {
         val keptNote = if (kept > 0) " $kept couldn't be verified and stay on the phone." else ""
@@ -414,6 +424,7 @@ class BackupWorker(context: Context, params: WorkerParameters) : CoroutineWorker
         const val KEY_MOVE = "move"
         const val KEY_MOVE_READY = "move_ready"
         const val KEY_MOVE_KEPT = "move_kept"
+        const val KEY_NO_SPACE = "no_space"
         const val KEY_PHASE = "phase"
         const val KEY_RATE = "rate"
         const val KEY_FILE_NAMES = "file_names"

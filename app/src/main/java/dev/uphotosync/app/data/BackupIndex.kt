@@ -14,7 +14,7 @@ import kotlinx.coroutines.flow.update
  * kept so an edited photo (new size) gets uploaded again.
  */
 class BackupIndex(context: Context) :
-    SQLiteOpenHelper(context, "backup_index.db", null, 2) {
+    SQLiteOpenHelper(context, "backup_index.db", null, 3) {
 
     override fun onCreate(db: SQLiteDatabase) {
         db.execSQL(
@@ -25,10 +25,38 @@ class BackupIndex(context: Context) :
                 "backed_up_at INTEGER NOT NULL)"
         )
         createDamaged(db)
+        createDatesFixed(db)
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
         if (oldVersion < 2) createDamaged(db)
+        if (oldVersion < 3) createDatesFixed(db)
+    }
+
+    /**
+     * Files whose NAS dates a backup has already tried to correct. Some servers don't keep a
+     * file's created time, so the fix would never stick; it's tried once per file, not every run.
+     */
+    private fun createDatesFixed(db: SQLiteDatabase) {
+        db.execSQL("CREATE TABLE IF NOT EXISTS dates_fixed(media_id INTEGER PRIMARY KEY)")
+    }
+
+    fun datesFixed(): Set<Long> {
+        val out = HashSet<Long>()
+        readableDatabase.rawQuery("SELECT media_id FROM dates_fixed", null).use { c -> while (c.moveToNext()) out += c.getLong(0) }
+        return out
+    }
+
+    fun markDatesFixed(ids: Collection<Long>) {
+        if (ids.isEmpty()) return
+        val db = writableDatabase
+        db.beginTransaction()
+        try {
+            ids.forEach { db.execSQL("INSERT OR IGNORE INTO dates_fixed(media_id) VALUES (?)", arrayOf(it)) }
+            db.setTransactionSuccessful()
+        } finally {
+            db.endTransaction()
+        }
     }
 
     /**
@@ -155,6 +183,7 @@ class BackupIndex(context: Context) :
     fun clear() {
         writableDatabase.delete("backed_up", null, null)
         writableDatabase.delete("damaged", null, null)
+        writableDatabase.delete("dates_fixed", null, null)
         _sizes.value = emptyMap()
         loaded = true
     }

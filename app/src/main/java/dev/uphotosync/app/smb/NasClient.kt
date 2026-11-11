@@ -237,6 +237,36 @@ class NasClient(private val settings: SettingsStore) {
     suspend fun list(path: String): List<NasEntry> = withShare { share -> listOn(share, path) }
 
     /**
+     * Every photo and video in [entries]: files as they are, folders searched all the way down.
+     * The .recycle folder is skipped unless it was picked itself (or something inside it).
+     */
+    suspend fun listMediaRecursive(entries: List<NasEntry>): List<NasEntry> = withShare { share ->
+        val out = ArrayList<NasEntry>()
+        val folders = ArrayDeque<String>()
+        for (e in entries) {
+            when {
+                e.isDirectory -> folders += e.path
+                e.isImage || e.isVideo -> out += e
+            }
+        }
+        val seen = HashSet<String>()
+        while (folders.isNotEmpty()) {
+            currentCoroutineContext().ensureActive()
+            val dir = folders.removeFirst()
+            if (!seen.add(dir.lowercase())) continue
+            for (child in listOn(share, dir)) {
+                when {
+                    child.isDirectory -> {
+                        if (!isInRecycle(child.path) || isInRecycle(dir)) folders += child.path
+                    }
+                    child.isImage || child.isVideo -> out += child
+                }
+            }
+        }
+        out
+    }
+
+    /**
      * Folders under [path] using [config] directly, so the destination can be picked
      * in Settings before the connection is saved.
      */

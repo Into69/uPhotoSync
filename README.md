@@ -45,7 +45,10 @@ To install it, open the APK on your phone. If Android asks, allow your browser o
 - **Backup history:** Settings → History lists recent backups, moves, checks and downloads, with timings, data transferred and any errors.
 - **Viewer:** a full-screen viewer for the phone and the NAS. Swipe between photos, pinch or double-tap to zoom. The Device tab groups photos by month.
 - **Videos:** play in the app, both phone videos and NAS videos. NAS videos stream over SMB with seeking, so nothing is downloaded first. NAS video thumbnails are taken from a frame, reading only a few MB of each file.
-- **Sorting:** both tabs can sort by date, name or size.
+- **Sorting and search:** both tabs can sort by date, name or size, and search by file name. The NAS tab searches the current folder.
+- **Album status:** the album picker shows how much of each album is backed up.
+- **Restore whole folders:** select folders or files on the NAS tab, then **Save to phone**. Every photo and video inside, including subfolders, goes back into its original phone folder. Files already on the phone are skipped.
+- **Space checks:** before a backup, the app warns if it won't fit on the NAS. During any backup, files that don't fit are set aside for later instead of failing partway. Restores warn if the phone is short on space.
 - **Crash reports:** if the app crashes, the next launch offers to share the error details. Nothing is sent automatically.
 - **Thumbnails or details:** switch either tab between a grid and a list showing date, size and backup status.
 - **Automatic backup:** new photos are uploaded shortly after you take them, and a full check runs every 6 hours.

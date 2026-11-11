@@ -5,6 +5,7 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Matrix
 import android.media.ExifInterface
+import android.net.ConnectivityManager
 import android.media.MediaDataSource
 import android.media.MediaMetadataRetriever
 import coil.disk.DiskCache
@@ -18,6 +19,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import dev.uphotosync.app.data.StorageSpace
 import okio.buffer
 import java.io.File
 
@@ -52,6 +54,27 @@ class NasThumbnails(private val context: Context, private val nas: NasClient) {
     }
 
     private val loads = HashMap<String, Load>()
+
+    /**
+     * Space the image cache uses and its limit, in bytes: NAS thumbnails, video frames and
+     * full-size NAS photos opened in the viewer. Call off the main thread.
+     */
+    fun cacheUsage(): StorageSpace? = diskCache?.let { StorageSpace(total = it.maxSize, free = it.maxSize - it.size) }
+
+    /**
+     * Empties the image cache (and the in-memory one). Thumbnails are simply made again when
+     * next needed. Call off the main thread.
+     */
+    fun clearCache() {
+        context.imageLoader.memoryCache?.clear()
+        diskCache?.clear()
+        // Leftovers from interrupted thumbnail or photo downloads. Only old ones: a recent temp
+        // file may belong to a download still running.
+        val cutoff = System.currentTimeMillis() - STALE_TEMP_MS
+        context.cacheDir.listFiles()?.filter {
+            (it.name.startsWith("thumb") || it.name.startsWith("nas")) && it.name.endsWith(".img") && it.lastModified() < cutoff
+        }?.forEach { it.delete() }
+    }
 
     fun isCached(thumb: NasThumb): Boolean =
         diskCache?.openSnapshot(cacheKey(thumb))?.use { true } ?: false
@@ -102,13 +125,19 @@ class NasThumbnails(private val context: Context, private val nas: NasClient) {
      * already downloading still finishes.
      */
     fun prefetch(thumbs: List<NasThumb>, owner: CoroutineScope): Job = owner.launch(Dispatchers.IO) {
-        for (thumb in thumbs) {
+        // Only on Wi-Fi or other unmetered networks, and only so many per folder: a big folder
+        // over mobile data or a VPN could otherwise pull many GB just by being open.
+        for (thumb in thumbs.take(MAX_PREFETCH)) {
             gate.awaitIdle() // what's on screen comes first
+            if (onMeteredNetwork()) break
             if (isCached(thumb)) continue
             runCatching { ensureCached(thumb) }
             delay(PREFETCH_PAUSE_MS)
         }
     }
+
+    private fun onMeteredNetwork(): Boolean =
+        context.getSystemService(ConnectivityManager::class.java).isActiveNetworkMetered
 
     private suspend fun generate(thumb: NasThumb, key: String) {
         val bitmap = if (thumb.isVideo) videoFrame(thumb) else photoThumbnail(thumb)
@@ -187,6 +216,9 @@ class NasThumbnails(private val context: Context, private val nas: NasClient) {
         const val SIZE = 512
         private const val JPEG_QUALITY = 85
         private const val FRAME_AT_US = 1_000_000L
+        private const val STALE_TEMP_MS = 60 * 60 * 1000L
+        /** Most thumbnails filled in per folder in the background; visible ones always load. */
+        private const val MAX_PREFETCH = 1000
         /** Breather between background thumbnails, so filling in a folder stays gentle. */
         private const val PREFETCH_PAUSE_MS = 150L
 

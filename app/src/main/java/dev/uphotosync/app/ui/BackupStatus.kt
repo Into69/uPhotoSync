@@ -157,6 +157,8 @@ class BackupStatusViewModel(app: Application) : AndroidViewModel(app) {
                 val kept = out.getInt(BackupWorker.KEY_MOVE_KEPT, 0)
                 "Move: $ready verified on the NAS" + if (kept > 0) ", $kept kept on the phone (couldn't verify)" else ""
             }
+            out.getInt(BackupWorker.KEY_NO_SPACE, 0) > 0 ->
+                "Last backup: $uploaded uploaded, ${out.getInt(BackupWorker.KEY_NO_SPACE, 0)} skipped. The NAS is nearly full."
             info.state == WorkInfo.State.FAILED && error != null -> "Last backup failed: $error"
             failed > 0 -> "Last backup: $uploaded uploaded, $failed failed" + (error?.let { " ($it)" } ?: "")
             uploaded > 0 -> "Last backup: $uploaded uploaded"

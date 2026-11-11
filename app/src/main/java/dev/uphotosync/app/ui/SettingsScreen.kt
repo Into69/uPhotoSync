@@ -28,6 +28,7 @@ import androidx.compose.material3.ListItem
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextOverflow
 import dev.uphotosync.app.data.NasPath
+import dev.uphotosync.app.data.StorageSpace
 import dev.uphotosync.app.smb.NasClient
 import dev.uphotosync.app.smb.NasEntry
 import dev.uphotosync.app.smb.NasShare
@@ -77,6 +78,8 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.Dispatchers
 
 class SettingsViewModel(app: Application) : AndroidViewModel(app) {
     private val graph = (app as PhotoSyncApp).graph
@@ -256,6 +259,22 @@ class SettingsViewModel(app: Application) : AndroidViewModel(app) {
         else "Quick check started"
     }
 
+    private val _imageCache = MutableStateFlow<StorageSpace?>(null)
+
+    /** How much space the image cache (NAS thumbnails and photos) uses, and its limit. */
+    val imageCache = _imageCache.asStateFlow()
+
+    fun refreshImageCache() = viewModelScope.launch {
+        _imageCache.value = withContext(Dispatchers.IO) { runCatching { graph.thumbnails.cacheUsage() }.getOrNull() }
+    }
+
+    fun clearImageCache() = viewModelScope.launch {
+        val before = _imageCache.value?.used ?: 0
+        withContext(Dispatchers.IO) { runCatching { graph.thumbnails.clearCache() } }
+        refreshImageCache().join()
+        _message.value = "Cleared ${formatSize(before)} of thumbnails. They're made again as you browse the NAS."
+    }
+
     fun resetIndex() {
         graph.index.clear()
         _message.value = "Backup history cleared; the next backup will re-check every file against the NAS"
@@ -271,6 +290,9 @@ fun SettingsScreen(vm: SettingsViewModel = viewModel()) {
     val albums by vm.albums.collectAsStateWithLifecycle()
     val testing by vm.testing.collectAsStateWithLifecycle()
     val message by vm.message.collectAsStateWithLifecycle()
+    val imageCache by vm.imageCache.collectAsStateWithLifecycle()
+    // Thumbnails are added while browsing the NAS, so re-read the size whenever Settings opens.
+    LaunchedEffect(Unit) { vm.refreshImageCache() }
     val picker by vm.picker.collectAsStateWithLifecycle()
     var confirmReset by remember { mutableStateOf(false) }
     var showCheck by remember { mutableStateOf(false) }
@@ -397,6 +419,21 @@ fun SettingsScreen(vm: SettingsViewModel = viewModel()) {
 
                 HorizontalDivider(Modifier.padding(vertical = 8.dp))
                 Section("Maintenance")
+                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                    Column(Modifier.weight(1f)) {
+                        Text("Thumbnail cache")
+                        Text(
+                            imageCache?.let { "${formatSize(it.used)} of ${formatSize(it.total)} · NAS thumbnails and photos" }
+                                ?: "Size unknown",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    OutlinedButton(
+                        onClick = { vm.clearImageCache() },
+                        enabled = (imageCache?.used ?: 0) > 0,
+                    ) { Text("Clear") }
+                }
                 Button(onClick = { vm.backUpNow() }) { Text("Back up everything now") }
                 FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     OutlinedButton(onClick = { showCheck = true }) { Text("Check backups") }
