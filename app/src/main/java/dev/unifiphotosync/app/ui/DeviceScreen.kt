@@ -27,6 +27,17 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.material3.Surface
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LifecycleEventEffect
+import android.app.Activity
+import android.app.RecoverableSecurityException
+import android.content.IntentSender
+import android.os.Build
+import androidx.activity.result.IntentSenderRequest
+import androidx.compose.material.icons.automirrored.filled.DriveFileMove
+import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Warning
+import androidx.compose.material3.AlertDialog
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.items
@@ -168,6 +179,88 @@ class DeviceViewModel(app: Application) : AndroidViewModel(app) {
     fun selectAllPending() = selected.update { state.value.items.filterNot(state.value::isBackedUp).mapTo(HashSet()) { it.id } }
     fun clearSelection() { selected.value = emptySet() }
 
+    /** How many selected items have no copy on the NAS yet, to warn before deleting. */
+    fun selectedNotBackedUp(): Int {
+        val s = state.value
+        return s.items.count { it.id in s.selected && !s.isBackedUp(it) }
+    }
+
+    private var pendingDelete: List<MediaItem> = emptyList()
+    private val deletedIds = ArrayList<Long>()
+
+    /**
+     * "Move to NAS" items whose NAS copy has been verified, still on the phone and waiting
+     * for the user to confirm deleting them.
+     */
+    val moveReady = combine(all, graph.moves.ids) { all, ids ->
+        all.orEmpty().filter { it.id in ids }
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+
+    /** Starts a move: upload, verify byte for byte, then delete from the phone. Manual only. */
+    suspend fun moveSelected(): Boolean {
+        if (graph.settings.config.first() == null) return false
+        graph.scheduler.backupNow(BackupScope.Items(selected.value), move = true)
+        clearSelection()
+        return true
+    }
+
+    /** "Keep on phone": the files stay on both the phone and the NAS. */
+    fun keepMovedFiles() = graph.moves.clear()
+
+    /**
+     * Starts deleting from the phone: [items], or the selection (NAS copies stay). Returns
+     * Android's confirmation prompt to show, or null if everything was deleted without one.
+     */
+    suspend fun startDelete(items: List<MediaItem>? = null): IntentSender? {
+        val ids = selected.value
+        pendingDelete = items ?: all.value.orEmpty().filter { it.id in ids }
+        deletedIds.clear()
+        if (pendingDelete.isEmpty()) return null
+        val resolver = getApplication<Application>().contentResolver
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            // One system dialog for the whole batch; the system deletes them if the user agrees.
+            MediaStore.createDeleteRequest(resolver, pendingDelete.map { it.uri }).intentSender
+        } else {
+            continueDelete()
+        }
+    }
+
+    /**
+     * Android 10: delete one by one. For each photo the app didn't create, Android asks
+     * the user first; returns that prompt, and is called again once it's been allowed.
+     */
+    suspend fun continueDelete(): IntentSender? = withContext(Dispatchers.IO) {
+        val resolver = getApplication<Application>().contentResolver
+        while (pendingDelete.isNotEmpty()) {
+            val item = pendingDelete.first()
+            try {
+                resolver.delete(item.uri, null, null)
+                deletedIds += item.id
+            } catch (e: RecoverableSecurityException) {
+                return@withContext e.userAction.actionIntent.intentSender
+            }
+            pendingDelete = pendingDelete.drop(1)
+        }
+        null
+    }
+
+    /** Called when deleting is finished or cancelled; returns a message for the user. */
+    fun finishDelete(confirmedBatch: Boolean): String {
+        // Android 11+: the system did the deleting, so count the whole batch if it was confirmed.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && confirmedBatch) {
+            deletedIds.clear()
+            deletedIds += pendingDelete.map { it.id }
+        }
+        val n = deletedIds.size
+        // A finished move: these no longer need deleting.
+        graph.moves.remove(deletedIds)
+        pendingDelete = emptyList()
+        deletedIds.clear()
+        clearSelection()
+        reload()
+        return if (n == 0) "Nothing deleted" else "Deleted $n ${if (n == 1) "item" else "items"} from this phone"
+    }
+
     /** Returns false if the NAS isn't set up yet. */
     suspend fun backUpSelected(): Boolean {
         if (graph.settings.config.first() == null) return false
@@ -213,11 +306,70 @@ fun DeviceScreen(onOpenSettings: () -> Unit, vm: DeviceViewModel = viewModel()) 
     val selecting = state.selected.isNotEmpty()
     BackHandler(enabled = selecting) { vm.clearSelection() }
 
+    // Deleting photos the app didn't create needs the user's OK in a system dialog.
+    var confirmUnbacked by remember { mutableStateOf(0) }
+    lateinit var deleteLauncher: androidx.activity.result.ActivityResultLauncher<IntentSenderRequest>
+    fun showOrFinish(sender: IntentSender?, confirmedBatch: Boolean = false) {
+        if (sender != null) deleteLauncher.launch(IntentSenderRequest.Builder(sender).build())
+        else scope.launch { snackbar.showSnackbar(vm.finishDelete(confirmedBatch)) }
+    }
+    deleteLauncher = rememberLauncherForActivityResult(ActivityResultContracts.StartIntentSenderForResult()) { result ->
+        val ok = result.resultCode == Activity.RESULT_OK
+        when {
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.R -> showOrFinish(null, confirmedBatch = ok)
+            // Android 10: the user allowed this photo; carry on with the rest.
+            ok -> scope.launch { showOrFinish(vm.continueDelete()) }
+            else -> showOrFinish(null)
+        }
+    }
+    fun startDelete(items: List<MediaItem>? = null) = scope.launch { showOrFinish(vm.startDelete(items)) }
+
+    // "Move to NAS": once copies are verified, ask Android to delete them from the phone.
+    val moveReady by vm.moveReady.collectAsStateWithLifecycle()
+    var confirmMove by remember { mutableStateOf(false) }
+    var lastPrompted by remember { mutableStateOf(emptySet<Long>()) }
+    LaunchedEffect(moveReady) {
+        // Prompt once per newly verified batch while the app is open; the banner stays as a fallback.
+        val ids = moveReady.mapTo(HashSet()) { it.id }
+        if (ids.isNotEmpty() && !lastPrompted.containsAll(ids)) {
+            lastPrompted = ids
+            startDelete(moveReady)
+        }
+    }
+
     fun startBackup(block: suspend () -> Boolean) = scope.launch {
         if (!block()) {
             val r = snackbar.showSnackbar("Set up your NAS first", actionLabel = "Settings")
             if (r == androidx.compose.material3.SnackbarResult.ActionPerformed) onOpenSettings()
         }
+    }
+
+    if (confirmMove) {
+        val n = state.selected.size
+        AlertDialog(
+            onDismissRequest = { confirmMove = false },
+            icon = { Icon(Icons.AutoMirrored.Filled.DriveFileMove, null) },
+            title = { Text("Move $n ${if (n == 1) "item" else "items"} to the NAS?") },
+            text = {
+                Text(
+                    "Each file is uploaded, then read back from the NAS and checked byte for byte. " +
+                        "Only files that match exactly are deleted from this phone, after you confirm. " +
+                        "Anything that can't be verified stays on the phone."
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = { confirmMove = false; startBackup(vm::moveSelected) }) { Text("Move") }
+            },
+            dismissButton = { TextButton(onClick = { confirmMove = false }) { Text("Cancel") } },
+        )
+    }
+
+    if (confirmUnbacked > 0) {
+        UnbackedDeleteDialog(
+            count = confirmUnbacked,
+            onConfirm = { confirmUnbacked = 0; startDelete() },
+            onDismiss = { confirmUnbacked = 0 },
+        )
     }
 
     Scaffold(
@@ -230,6 +382,14 @@ fun DeviceScreen(onOpenSettings: () -> Unit, vm: DeviceViewModel = viewModel()) 
                     title = { Text("${state.selected.size} selected") },
                     actions = {
                         IconButton(onClick = vm::selectAllPending) { Icon(Icons.Filled.SelectAll, "Select all not backed up") }
+                        IconButton(onClick = { confirmMove = true }) {
+                            Icon(Icons.AutoMirrored.Filled.DriveFileMove, "Move to NAS")
+                        }
+                        IconButton(onClick = {
+                            // Warn first if any of these would be lost for good (no NAS copy yet).
+                            val unbacked = vm.selectedNotBackedUp()
+                            if (unbacked > 0) confirmUnbacked = unbacked else startDelete()
+                        }) { Icon(Icons.Filled.Delete, "Delete from phone") }
                         IconButton(onClick = { startBackup(vm::backUpSelected) }) {
                             Icon(Icons.Filled.CloudUpload, "Back up selected")
                         }
@@ -265,6 +425,21 @@ fun DeviceScreen(onOpenSettings: () -> Unit, vm: DeviceViewModel = viewModel()) 
     ) { padding ->
         Column(Modifier.padding(padding)) {
             BackupStatusBanner()
+            if (moveReady.isNotEmpty()) {
+                Surface(color = MaterialTheme.colorScheme.tertiaryContainer, modifier = Modifier.fillMaxWidth()) {
+                    Column(Modifier.padding(start = 16.dp, end = 8.dp, top = 8.dp)) {
+                        Text(
+                            "${moveReady.size} moved ${if (moveReady.size == 1) "file is" else "files are"} " +
+                                "verified on the NAS. Delete from this phone to finish the move.",
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                        Row(Modifier.align(Alignment.End)) {
+                            TextButton(onClick = vm::keepMovedFiles) { Text("Keep on phone") }
+                            TextButton(onClick = { startDelete(moveReady) }) { Text("Delete now") }
+                        }
+                    }
+                }
+            }
             if (access == MediaAccess.Partial) {
                 Surface(color = MaterialTheme.colorScheme.errorContainer, modifier = Modifier.fillMaxWidth()) {
                     Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(start = 16.dp, end = 8.dp)) {
@@ -299,6 +474,26 @@ fun DeviceScreen(onOpenSettings: () -> Unit, vm: DeviceViewModel = viewModel()) 
             }
         }
     }
+}
+
+@Composable
+private fun UnbackedDeleteDialog(count: Int, onConfirm: () -> Unit, onDismiss: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        icon = { Icon(Icons.Filled.Warning, null, tint = MaterialTheme.colorScheme.error) },
+        title = { Text("Not backed up yet") },
+        text = {
+            Text(
+                "$count of the selected ${if (count == 1) "item isn't" else "items aren't"} on the NAS yet. " +
+                    "Deleting from the phone will lose ${if (count == 1) "it" else "them"} for good. Back up first, " +
+                    "or delete anyway?"
+            )
+        },
+        confirmButton = {
+            TextButton(onClick = onConfirm) { Text("Delete anyway", color = MaterialTheme.colorScheme.error) }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+    )
 }
 
 @Composable

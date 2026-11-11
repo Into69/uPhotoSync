@@ -16,6 +16,8 @@ data class MediaItem(
     val size: Long,
     /** Capture time in epoch millis (falls back to the time it was added). */
     val takenAt: Long,
+    /** Last-modified time in epoch millis; stamped on the NAS copy so matches can be checked cheaply. */
+    val modifiedAt: Long,
     val bucketId: String,
     val bucketName: String,
     /** Folder on the phone, e.g. "DCIM/Camera"; backups mirror it on the NAS. */
@@ -36,6 +38,7 @@ class MediaRepository(private val context: Context) {
             FileColumns.SIZE,
             FileColumns.DATE_TAKEN,
             FileColumns.DATE_ADDED,
+            FileColumns.DATE_MODIFIED,
             FileColumns.BUCKET_ID,
             FileColumns.BUCKET_DISPLAY_NAME,
             FileColumns.RELATIVE_PATH,
@@ -57,6 +60,7 @@ class MediaRepository(private val context: Context) {
             val iSize = c.getColumnIndexOrThrow(FileColumns.SIZE)
             val iTaken = c.getColumnIndexOrThrow(FileColumns.DATE_TAKEN)
             val iAdded = c.getColumnIndexOrThrow(FileColumns.DATE_ADDED)
+            val iModified = c.getColumnIndexOrThrow(FileColumns.DATE_MODIFIED)
             val iBucket = c.getColumnIndexOrThrow(FileColumns.BUCKET_ID)
             val iBucketName = c.getColumnIndexOrThrow(FileColumns.BUCKET_DISPLAY_NAME)
             val iRelPath = c.getColumnIndexOrThrow(FileColumns.RELATIVE_PATH)
@@ -74,6 +78,7 @@ class MediaRepository(private val context: Context) {
                     mimeType = c.getString(iMime) ?: if (isVideo) "video/*" else "image/*",
                     size = c.getLong(iSize),
                     takenAt = taken,
+                    modifiedAt = c.getLong(iModified) * 1000,
                     bucketId = c.getString(iBucket) ?: "",
                     bucketName = c.getString(iBucketName) ?: "Other",
                     relativePath = c.getString(iRelPath)?.trim('/')?.takeIf { it.isNotBlank() }

@@ -10,6 +10,8 @@ import java.net.NoRouteToHostException
 import java.net.SocketTimeoutException
 import java.net.UnknownHostException
 import com.hierynomus.msfscc.FileAttributes
+import com.hierynomus.msdtyp.FileTime
+import com.hierynomus.msfscc.fileinformation.FileBasicInformation
 import com.hierynomus.mssmb2.SMB2CreateDisposition
 import com.hierynomus.mssmb2.SMB2ShareAccess
 import com.hierynomus.security.bc.BCSecurityProvider
@@ -207,6 +209,23 @@ class NasClient(private val settings: SettingsStore) {
             .sortedWith(compareBy<NasEntry>({ !it.isDirectory }, { it.name.lowercase() }))
     }
 
+    /**
+     * Deletes files and folders (folders with everything in them). Returns how many were
+     * deleted; stops at the first failure and throws, so nothing is silently skipped.
+     */
+    suspend fun delete(entries: List<NasEntry>): Int = withShare { share ->
+        var deleted = 0
+        for (e in entries) {
+            val path = NasPath.clean(e.path)
+            when {
+                e.isDirectory -> if (share.folderExists(path)) share.rmdir(path, true)
+                share.fileExists(path) -> share.rm(path)
+            }
+            deleted++
+        }
+        deleted
+    }
+
     /** Streams a file from the share into [out]. */
     suspend fun download(path: String, out: OutputStream) = withShare { share ->
         share.openFile(
@@ -253,23 +272,86 @@ class NasClient(private val settings: SettingsStore) {
             }
         }
 
-        /** Lower-cased file name -> size for the files in [dir]; empty if the folder doesn't exist. */
-        fun fileSizes(share: DiskShare, dir: String): Map<String, Long> {
-            if (!share.folderExists(dir)) return emptyMap()
-            return share.list(dir)
+        /** A file in a NAS folder listing. */
+        data class RemoteFile(val name: String, val size: Long, val modifiedAt: Long)
+
+        /**
+         * The files in [dir], keyed by lower-cased name (SMB names are case-insensitive);
+         * null if the folder doesn't exist. One request for a whole folder, so callers can
+         * check many files without a round-trip each.
+         */
+        fun listFiles(share: DiskShare, dir: String): Map<String, RemoteFile>? {
+            val clean = NasPath.clean(dir)
+            if (clean.isNotEmpty() && !share.folderExists(clean)) return null
+            return share.list(clean)
                 .filter { it.fileAttributes and FileAttributes.FILE_ATTRIBUTE_DIRECTORY.value == 0L }
-                .associate { it.fileName.lowercase() to it.endOfFile }
+                .associate {
+                    it.fileName.lowercase() to RemoteFile(it.fileName, it.endOfFile, it.lastWriteTime.toEpochMillis())
+                }
+        }
+
+        /** Lower-cased file name -> size for the files in [dir]; empty if the folder doesn't exist. */
+        fun fileSizes(share: DiskShare, dir: String): Map<String, Long> =
+            listFiles(share, dir).orEmpty().mapValues { it.value.size }
+
+        /**
+         * SHA-256 of the file at [path] on the share, read in full. [onBytes] gets the bytes
+         * read so far, for progress and transfer rate.
+         */
+        suspend fun sha256(share: DiskShare, path: String, onBytes: suspend (Long) -> Unit = {}): ByteArray {
+            val md = java.security.MessageDigest.getInstance("SHA-256")
+            share.openFile(
+                NasPath.clean(path), EnumSet.of(AccessMask.GENERIC_READ), null,
+                SMB2ShareAccess.ALL, SMB2CreateDisposition.FILE_OPEN, null,
+            ).use { f ->
+                f.inputStream.use { input ->
+                    val buf = ByteArray(BUFFER)
+                    var total = 0L
+                    while (true) {
+                        currentCoroutineContext().ensureActive()
+                        val n = input.read(buf)
+                        if (n < 0) break
+                        md.update(buf, 0, n)
+                        total += n
+                        onBytes(total)
+                    }
+                }
+            }
+            return md.digest()
         }
 
         /** Size of the file at [path], or null if there is none. */
         fun sizeOf(share: DiskShare, path: String): Long? =
             if (share.fileExists(path)) share.getFileInformation(path).standardInformation.endOfFile else null
 
+        /** Sets the file's "last modified" time on the NAS, leaving its other times alone. */
+        fun setModified(share: DiskShare, path: String, modifiedAt: Long) {
+            share.openFile(
+                NasPath.clean(path), EnumSet.of(AccessMask.FILE_WRITE_ATTRIBUTES, AccessMask.FILE_READ_ATTRIBUTES), null,
+                SMB2ShareAccess.ALL, SMB2CreateDisposition.FILE_OPEN, null,
+            ).use { it.setFileInformation(modifiedInfo(modifiedAt)) }
+        }
+
+        private fun modifiedInfo(modifiedAt: Long) = FileBasicInformation(
+            FileBasicInformation.DONT_SET, FileBasicInformation.DONT_SET,
+            FileTime.ofEpochMillis(modifiedAt), FileBasicInformation.DONT_SET,
+            0L, // 0 = leave attributes unchanged
+        )
+
         /**
          * Uploads to "<path>.partial" and renames it into place only once complete, so
-         * an interrupted backup never leaves a truncated file that looks finished.
+         * an interrupted backup never leaves a truncated file that looks finished. The copy
+         * gets the phone file's [modifiedAt] time, so later runs can recognize it from a
+         * folder listing alone. [replace] overwrites an existing file at [path].
          */
-        suspend fun upload(share: DiskShare, input: InputStream, path: String, onBytes: suspend (Long) -> Unit) {
+        suspend fun upload(
+            share: DiskShare,
+            input: InputStream,
+            path: String,
+            modifiedAt: Long,
+            replace: Boolean = false,
+            onBytes: suspend (Long) -> Unit,
+        ) {
             val tmp = path + PARTIAL
             share.openFile(
                 tmp, EnumSet.of(AccessMask.GENERIC_WRITE), null,
@@ -288,10 +370,15 @@ class NasClient(private val settings: SettingsStore) {
                     }
                 }
             }
+            // Stamp the time on a fresh handle after the writes are closed (closing a written
+            // handle would update it again), then move the finished file into place.
             share.openFile(
-                tmp, EnumSet.of(AccessMask.DELETE, AccessMask.GENERIC_READ), null,
+                tmp, EnumSet.of(AccessMask.DELETE, AccessMask.GENERIC_READ, AccessMask.FILE_WRITE_ATTRIBUTES), null,
                 SMB2ShareAccess.ALL, SMB2CreateDisposition.FILE_OPEN, null,
-            ).use { it.rename(path, false) }
+            ).use { f ->
+                if (modifiedAt > 0) runCatching { f.setFileInformation(modifiedInfo(modifiedAt)) }
+                f.rename(path, replace)
+            }
         }
     }
 }

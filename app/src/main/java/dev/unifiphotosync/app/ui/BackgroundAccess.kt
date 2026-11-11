@@ -40,15 +40,19 @@ private data class AccessState(
     val notifications: Boolean,
     val battery: Boolean,
     val restricted: Boolean,
+    val preciseLocation: Boolean,
+    val backgroundLocation: Boolean,
+    val locationOn: Boolean,
 ) {
-    val allGood get() = media == MediaAccess.Full && notifications && battery && !restricted
-
     companion object {
         fun read(context: Context) = AccessState(
             media = AppPermissions.mediaAccess(context),
             notifications = AppPermissions.notificationsAllowed(context),
             battery = AppPermissions.batteryUnrestricted(context),
             restricted = AppPermissions.backgroundRestricted(context),
+            preciseLocation = AppPermissions.preciseLocation(context),
+            backgroundLocation = AppPermissions.backgroundLocation(context),
+            locationOn = AppPermissions.locationEnabled(context),
         )
     }
 }
@@ -57,10 +61,11 @@ private data class AccessState(
  * Status and fix buttons for everything backups need to run in the background:
  * full photo access, notifications (for the foreground upload service), battery
  * optimization exemption (so Doze doesn't hold back scheduled runs), and no
- * background restriction.
+ * background restriction. With [needsWifiName] (backups limited to named Wi-Fi
+ * networks), also the location access Android requires before revealing the Wi-Fi name.
  */
 @Composable
-fun BackgroundAccessPanel(modifier: Modifier = Modifier) {
+fun BackgroundAccessPanel(modifier: Modifier = Modifier, needsWifiName: Boolean = false) {
     val context = LocalContext.current
     // Bumped to re-read state after returning from a permission dialog or system settings.
     var refresh by remember { mutableIntStateOf(0) }
@@ -76,6 +81,16 @@ fun BackgroundAccessPanel(modifier: Modifier = Modifier) {
     }
     val notificationLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { ok ->
         if (!ok) context.startActivity(AppPermissions.notificationSettingsIntent(context))
+        refresh++
+    }
+    // Android requires precise location first; "Allow all the time" is a separate, second request
+    // (on Android 11+ the system shows it as a settings page).
+    val locationLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
+        if (!AppPermissions.preciseLocation(context)) context.startActivity(AppPermissions.appSettingsIntent(context))
+        refresh++
+    }
+    val backgroundLocationLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { ok ->
+        if (!ok) context.startActivity(AppPermissions.appSettingsIntent(context))
         refresh++
     }
 
@@ -123,6 +138,36 @@ fun BackgroundAccessPanel(modifier: Modifier = Modifier) {
             action = "Open settings",
             onFix = { context.startActivity(AppPermissions.appSettingsIntent(context)) },
         )
+        if (needsWifiName) {
+            val locationOk = state.preciseLocation && state.backgroundLocation
+            AccessRow(
+                ok = locationOk,
+                title = "Location: allow all the time",
+                detail = when {
+                    locationOk -> "Allowed"
+                    !state.preciseLocation ->
+                        "Android only shows the Wi-Fi name to apps with precise location. It's not used for anything else."
+                    else -> "Choose \"Allow all the time\" so backups running in the background can check the Wi-Fi name"
+                },
+                action = "Allow",
+                onFix = {
+                    if (!state.preciseLocation) {
+                        locationLauncher.launch(
+                            arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION)
+                        )
+                    } else {
+                        backgroundLocationLauncher.launch(Manifest.permission.ACCESS_BACKGROUND_LOCATION)
+                    }
+                },
+            )
+            AccessRow(
+                ok = state.locationOn,
+                title = "Location turned on",
+                detail = if (state.locationOn) "On" else "With location off, Android hides the Wi-Fi name",
+                action = "Turn on",
+                onFix = { context.startActivity(AppPermissions.locationSettingsIntent()) },
+            )
+        }
     }
 }
 
@@ -148,11 +193,11 @@ private fun AccessRow(ok: Boolean, title: String, detail: String, action: String
  * missing. Closes by itself once everything is allowed.
  */
 @Composable
-fun BackgroundAccessDialog(onDismiss: () -> Unit) {
+fun BackgroundAccessDialog(needsWifiName: Boolean = false, onDismiss: () -> Unit) {
     val context = LocalContext.current
     var refresh by remember { mutableIntStateOf(0) }
     LifecycleEventEffect(Lifecycle.Event.ON_RESUME) { refresh++ }
-    val ready = remember(refresh) { AppPermissions.readyForBackground(context) }
+    val ready = remember(refresh) { AppPermissions.readyForBackground(context, needsWifiName) }
     LaunchedEffect(ready) { if (ready) onDismiss() }
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -164,7 +209,7 @@ fun BackgroundAccessDialog(onDismiss: () -> Unit) {
                     style = MaterialTheme.typography.bodyMedium,
                     modifier = Modifier.padding(bottom = 8.dp),
                 )
-                BackgroundAccessPanel()
+                BackgroundAccessPanel(needsWifiName = needsWifiName)
             }
         },
         confirmButton = { TextButton(onClick = onDismiss) { Text("Done") } },

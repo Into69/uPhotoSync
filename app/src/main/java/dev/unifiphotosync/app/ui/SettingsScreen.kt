@@ -242,6 +242,17 @@ class SettingsViewModel(app: Application) : AndroidViewModel(app) {
         graph.scheduler.backupNow(BackupScope.All)
     }
 
+    /** "Check backups": quick (names and sizes) or full (byte for byte), optionally repairing. */
+    fun checkBackups(full: Boolean, repair: Boolean) = viewModelScope.launch {
+        if (graph.settings.config.first() == null) {
+            _message.value = "Save the NAS connection first"
+            return@launch
+        }
+        graph.scheduler.checkNow(full, repair)
+        _message.value = if (full) "Full check started. It reads every file back from the NAS, so it takes a while."
+        else "Quick check started"
+    }
+
     fun resetIndex() {
         graph.index.clear()
         _message.value = "Backup history cleared; the next backup will re-check every file against the NAS"
@@ -259,12 +270,17 @@ fun SettingsScreen(vm: SettingsViewModel = viewModel()) {
     val message by vm.message.collectAsStateWithLifecycle()
     val picker by vm.picker.collectAsStateWithLifecycle()
     var confirmReset by remember { mutableStateOf(false) }
+    var showCheck by remember { mutableStateOf(false) }
     val context = LocalContext.current
     var askBackground by remember { mutableStateOf(false) }
     // Turning on automatic or scheduled backup: make sure Android will let it run.
     val setPrefs: (BackupPrefs) -> Unit = { p ->
-        val turningOn = (p.autoBackup && !prefs.autoBackup) || (p.scheduled && !prefs.scheduled)
-        if (turningOn && !AppPermissions.readyForBackground(context)) askBackground = true
+        // Also when the first Wi-Fi name is added, which brings in the location requirement.
+        val turningOn = (p.autoBackup && !prefs.autoBackup) || (p.scheduled && !prefs.scheduled) ||
+            (p.ssidRestricted && !prefs.ssidRestricted)
+        if (turningOn && p.anyAutomatic && !AppPermissions.readyForBackground(context, p.ssidRestricted)) {
+            askBackground = true
+        }
         vm.setPrefs(p)
     }
 
@@ -301,7 +317,10 @@ fun SettingsScreen(vm: SettingsViewModel = viewModel()) {
                     modifier = Modifier.padding(top = 8.dp),
                 )
                 ToggleRow("Only on Wi-Fi / unmetered networks", prefs.unmeteredOnly, enabled = prefs.anyAutomatic) {
-                    vm.setPrefs(prefs.copy(unmeteredOnly = it))
+                    setPrefs(prefs.copy(unmeteredOnly = it))
+                }
+                if (prefs.unmeteredOnly) {
+                    WifiNetworkSettings(prefs, enabled = prefs.anyAutomatic, onChange = setPrefs)
                 }
                 ToggleRow("Only while charging", prefs.chargingOnly, enabled = prefs.anyAutomatic) {
                     vm.setPrefs(prefs.copy(chargingOnly = it))
@@ -336,12 +355,13 @@ fun SettingsScreen(vm: SettingsViewModel = viewModel()) {
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
-                BackgroundAccessPanel()
+                BackgroundAccessPanel(needsWifiName = prefs.ssidRestricted)
 
                 HorizontalDivider(Modifier.padding(vertical = 8.dp))
                 Section("Maintenance")
+                Button(onClick = { vm.backUpNow() }) { Text("Back up everything now") }
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Button(onClick = { vm.backUpNow() }) { Text("Back up everything now") }
+                    OutlinedButton(onClick = { showCheck = true }) { Text("Check backups") }
                     TextButton(onClick = { confirmReset = true }) { Text("Reset history") }
                 }
             }
@@ -360,7 +380,16 @@ fun SettingsScreen(vm: SettingsViewModel = viewModel()) {
         )
     }
 
-    if (askBackground) BackgroundAccessDialog(onDismiss = { askBackground = false })
+    if (askBackground) {
+        BackgroundAccessDialog(needsWifiName = prefs.ssidRestricted, onDismiss = { askBackground = false })
+    }
+
+    if (showCheck) {
+        CheckBackupsDialog(
+            onStart = { full, repair -> vm.checkBackups(full, repair); showCheck = false },
+            onDismiss = { showCheck = false },
+        )
+    }
 
     if (confirmReset) {
         AlertDialog(

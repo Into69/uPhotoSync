@@ -64,7 +64,12 @@ data class BackupPrefs(
     val scheduleMinutes: Int = 2 * 60,
     /** ISO days of week (1 = Monday ... 7 = Sunday). */
     val scheduleDays: Set<Int> = (1..7).toSet(),
+    /** With [unmeteredOnly]: only these Wi-Fi networks (SSIDs); empty means any Wi-Fi. */
+    val wifiSsids: Set<String> = emptySet(),
 ) {
+    /** True when automatic backups are limited to specific Wi-Fi names. */
+    val ssidRestricted get() = unmeteredOnly && wifiSsids.isNotEmpty()
+
     /** The Wi-Fi/charging/album options matter when either kind of automatic backup is on. */
     val anyAutomatic get() = autoBackup || scheduled
 }
@@ -84,6 +89,7 @@ class SettingsStore(private val context: Context) {
         val scheduled = booleanPreferencesKey("scheduled")
         val scheduleMinutes = intPreferencesKey("schedule_minutes")
         val scheduleDays = stringSetPreferencesKey("schedule_days")
+        val wifiSsids = stringSetPreferencesKey("wifi_ssids")
     }
 
     /** Thumbnails or details for a browser screen, remembered per [screen] ("device", "nas"). */
@@ -121,6 +127,7 @@ class SettingsStore(private val context: Context) {
             scheduled = p[Keys.scheduled] ?: false,
             scheduleMinutes = p[Keys.scheduleMinutes] ?: 2 * 60,
             scheduleDays = p[Keys.scheduleDays]?.mapNotNull { it.toIntOrNull() }?.toSet() ?: (1..7).toSet(),
+            wifiSsids = p[Keys.wifiSsids] ?: emptySet(),
         )
     }
 
@@ -144,6 +151,7 @@ class SettingsStore(private val context: Context) {
             p[Keys.scheduled] = b.scheduled
             p[Keys.scheduleMinutes] = b.scheduleMinutes
             p[Keys.scheduleDays] = b.scheduleDays.mapTo(HashSet()) { it.toString() }
+            p[Keys.wifiSsids] = b.wifiSsids
         }
     }
 }

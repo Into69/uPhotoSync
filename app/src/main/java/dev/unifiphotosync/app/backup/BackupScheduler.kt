@@ -4,6 +4,7 @@ import android.content.Context
 import android.provider.MediaStore
 import androidx.work.BackoffPolicy
 import androidx.work.Constraints
+import androidx.work.Data
 import androidx.work.ExistingPeriodicWorkPolicy
 import androidx.work.ExistingWorkPolicy
 import androidx.work.NetworkType
@@ -105,7 +106,11 @@ class BackupScheduler(private val context: Context) {
         wm.enqueueUniqueWork(TRIGGER, policy, request)
     }
 
-    fun backupNow(scope: BackupScope) {
+    /**
+     * Back up now. With [move] ("Move to NAS", manual only, never scheduled), the job also
+     * verifies each copy and queues the verified files for deletion from the phone.
+     */
+    fun backupNow(scope: BackupScope, move: Boolean = false) {
         val input = when (scope) {
             BackupScope.All -> workDataOf(BackupWorker.KEY_SCOPE to BackupWorker.SCOPE_ALL)
             is BackupScope.Album -> workDataOf(
@@ -125,7 +130,29 @@ class BackupScheduler(private val context: Context) {
         val request = OneTimeWorkRequestBuilder<BackupWorker>()
             .setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build())
             .setExpedited(OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
-            .setInputData(input)
+            .setInputData(if (move) Data.Builder().putAll(input).putBoolean(BackupWorker.KEY_MOVE, true).build() else input)
+            .addTag(TAG)
+            .addTag(TAG_MANUAL)
+            .build()
+        wm.enqueueUniqueWork(MANUAL, ExistingWorkPolicy.APPEND_OR_REPLACE, request)
+    }
+
+    /**
+     * "Check backups": confirms everything marked as backed up is really on the NAS. [full]
+     * also compares every file byte for byte; [repair] re-uploads anything missing or different.
+     */
+    fun checkNow(full: Boolean, repair: Boolean) {
+        val request = OneTimeWorkRequestBuilder<BackupWorker>()
+            .setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build())
+            .setExpedited(OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
+            .setInputData(
+                workDataOf(
+                    // A scope marks it as manual, so Wi-Fi-name limits for automatic runs don't apply.
+                    BackupWorker.KEY_SCOPE to BackupWorker.SCOPE_ALL,
+                    BackupWorker.KEY_CHECK to if (full) BackupWorker.CHECK_FULL else BackupWorker.CHECK_QUICK,
+                    BackupWorker.KEY_REPAIR to repair,
+                )
+            )
             .addTag(TAG)
             .addTag(TAG_MANUAL)
             .build()

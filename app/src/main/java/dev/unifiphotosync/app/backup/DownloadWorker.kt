@@ -13,6 +13,9 @@ import dev.unifiphotosync.app.R
 import dev.unifiphotosync.app.data.NasPath
 import dev.unifiphotosync.app.smb.NasClient
 import dev.unifiphotosync.app.smb.NasEntry
+import dev.unifiphotosync.app.ui.MainActivity
+import dev.unifiphotosync.app.ui.Tab
+import dev.unifiphotosync.app.ui.formatSize
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
@@ -40,10 +43,12 @@ class DownloadWorker(context: Context, params: WorkerParameters) : CoroutineWork
             coroutineScope {
                 // Report progress twice a second rather than on every buffer write.
                 val reporter = launch {
+                    val meter = RateMeter()
                     while (isActive) {
                         val bytes = written.get()
-                        setProgress(workDataOf(KEY_BYTES to bytes, KEY_SIZE to size))
-                        notify(foregroundInfo(bytes))
+                        val rate = meter.update(bytes)
+                        setProgress(workDataOf(KEY_BYTES to bytes, KEY_SIZE to size, KEY_RATE to rate))
+                        notify(foregroundInfo(bytes, rate))
                         delay(500)
                     }
                 }
@@ -69,14 +74,18 @@ class DownloadWorker(context: Context, params: WorkerParameters) : CoroutineWork
         if (nm.areNotificationsEnabled()) runCatching { nm.notify(notificationId, info.notification) }
     }
 
-    private fun foregroundInfo(bytes: Long): ForegroundInfo {
+    private fun foregroundInfo(bytes: Long, bytesPerSecond: Long = 0): ForegroundInfo {
         val max = if (size > 0) 1000 else 0
         val progress = if (size > 0) (bytes * 1000 / size).toInt().coerceIn(0, 1000) else 0
         val notification = NotificationCompat.Builder(applicationContext, PhotoSyncApp.CHANNEL_BACKUP)
             .setSmallIcon(R.drawable.ic_backup)
             .setContentTitle("Saving to phone")
-            .setContentText(name)
+            .setContentText(
+                if (bytesPerSecond > 0) "$name · " + formatSize(bytesPerSecond) + "/s" else name
+            )
             .setProgress(max, progress, size <= 0)
+            // Tapping opens the NAS tab, where downloads are shown.
+            .setContentIntent(MainActivity.openIntent(applicationContext, Tab.Nas))
             .setOngoing(true)
             .setSilent(true)
             .build()
@@ -91,6 +100,7 @@ class DownloadWorker(context: Context, params: WorkerParameters) : CoroutineWork
         const val KEY_SIZE = "size"
         const val KEY_MODIFIED = "modified"
         const val KEY_BYTES = "bytes"
+        const val KEY_RATE = "rate"
         const val KEY_NAME = "name"
         const val KEY_ERROR = "error"
         private const val NOTIFICATION_BASE = 2000

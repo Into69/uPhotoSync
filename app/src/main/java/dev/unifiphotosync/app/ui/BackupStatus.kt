@@ -42,6 +42,12 @@ data class BackupStatus(
     val current: String? = null,
     val fileBytes: Long = 0,
     val fileSize: Long = 0,
+    /** Reading copies back from the NAS to check them (Move to NAS). */
+    val verifying: Boolean = false,
+    /** Upload, Verify or Check (see BackupEngine.Phase). */
+    val phase: String = "Upload",
+    /** Current transfer rate in bytes per second. */
+    val bytesPerSecond: Long = 0,
     /** Outcome of the most recent finished run, if it's worth showing. */
     val lastResult: String? = null,
 )
@@ -67,6 +73,9 @@ class BackupStatusViewModel(app: Application) : AndroidViewModel(app) {
                 current = p.getString(BackupWorker.KEY_CURRENT),
                 fileBytes = p.getLong(BackupWorker.KEY_FILE_BYTES, 0),
                 fileSize = p.getLong(BackupWorker.KEY_FILE_SIZE, 0),
+                verifying = p.getBoolean(BackupWorker.KEY_VERIFYING, false),
+                phase = p.getString(BackupWorker.KEY_PHASE) ?: "Upload",
+                bytesPerSecond = p.getLong(BackupWorker.KEY_RATE, 0),
             )
         }
         // A manual run that's queued (e.g. waiting for a network) but not started yet.
@@ -74,7 +83,7 @@ class BackupStatusViewModel(app: Application) : AndroidViewModel(app) {
             it.state == WorkInfo.State.ENQUEUED && BackupScheduler.TAG_MANUAL in it.tags
         }
         val last = infos.filter { it.state.isFinished && it.state != WorkInfo.State.CANCELLED }
-            .maxByOrNull { it.outputData.keyValueMap.size } // finished runs carry results
+            .maxByOrNull { it.outputData.getLong(BackupWorker.KEY_FINISHED_AT, 0) }
             ?.let { describe(it) }
         return BackupStatus(waiting = waiting, lastResult = last)
     }
@@ -84,7 +93,15 @@ class BackupStatusViewModel(app: Application) : AndroidViewModel(app) {
         val uploaded = out.getInt(BackupWorker.KEY_UPLOADED, 0)
         val failed = out.getInt(BackupWorker.KEY_FAILED, 0)
         val error = out.getString(BackupWorker.KEY_ERROR)
+        val skipped = out.getString(BackupWorker.KEY_SKIPPED)
         return when {
+            skipped != null -> skipped
+            out.getString(BackupWorker.KEY_CHECK_RESULT) != null -> out.getString(BackupWorker.KEY_CHECK_RESULT)
+            out.getInt(BackupWorker.KEY_MOVE_READY, 0) > 0 || out.getInt(BackupWorker.KEY_MOVE_KEPT, 0) > 0 -> {
+                val ready = out.getInt(BackupWorker.KEY_MOVE_READY, 0)
+                val kept = out.getInt(BackupWorker.KEY_MOVE_KEPT, 0)
+                "Move: $ready verified on the NAS" + if (kept > 0) ", $kept kept on the phone (couldn't verify)" else ""
+            }
             info.state == WorkInfo.State.FAILED && error != null -> "Last backup failed: $error"
             failed > 0 -> "Last backup: $uploaded uploaded, $failed failed" + (error?.let { " ($it)" } ?: "")
             uploaded > 0 -> "Last backup: $uploaded uploaded"
@@ -117,7 +134,11 @@ fun BackupStatusBanner(vm: BackupStatusViewModel = viewModel()) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text(
                         text = when {
-                            s.running && s.total > 0 -> "Backing up ${minOf(s.done + 1, s.total)} of ${s.total}"
+                            s.running && s.total > 0 -> when (s.phase) {
+                                "Verify" -> "Verifying on NAS "
+                                "Check" -> "Checking backups "
+                                else -> "Backing up "
+                            } + "${minOf(s.done + 1, s.total)} of ${s.total}"
                             s.running -> "Checking for new photos…"
                             s.waiting -> "Backup queued, waiting for network"
                             else -> s.lastResult.orEmpty()
@@ -135,7 +156,11 @@ fun BackupStatusBanner(vm: BackupStatusViewModel = viewModel()) {
                     val fileFraction = if (s.fileSize > 0) (s.fileBytes.toFloat() / s.fileSize).coerceIn(0f, 1f) else 0f
                     ProgressLine(
                         label = s.current ?: "Preparing…",
-                        detail = if (s.fileSize > 0) "${formatSize(s.fileBytes)} / ${formatSize(s.fileSize)}" else "",
+                        // Bytes of this file so far, plus the transfer rate.
+                        detail = listOfNotNull(
+                            if (s.fileSize > 0 && s.fileBytes > 0) "${formatSize(s.fileBytes)} / ${formatSize(s.fileSize)}" else null,
+                            if (s.bytesPerSecond > 0) formatSize(s.bytesPerSecond) + "/s" else null,
+                        ).joinToString(" · "),
                         progress = fileFraction,
                     )
                     // Whole job: finished files plus the share of the current one.

@@ -3,7 +3,18 @@ package dev.unifiphotosync.app.ui
 import android.app.Application
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
+import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.SelectAll
+import androidx.compose.material3.Checkbox
+import androidx.compose.material3.ListItemDefaults
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -89,6 +100,11 @@ data class NasUiState(
     val downloading: String? = null,
     /** Progress of the running download, when its size is known. */
     val downloadProgress: Float? = null,
+    /** Transfer rate of the running download, bytes per second. */
+    val downloadRate: Long = 0,
+    /** Paths selected with a long-press, for deleting. */
+    val selected: Set<String> = emptySet(),
+    val deleting: Boolean = false,
 )
 
 class NasViewModel(app: Application) : AndroidViewModel(app) {
@@ -121,7 +137,9 @@ class NasViewModel(app: Application) : AndroidViewModel(app) {
 
     fun open(path: String) {
         loadJob?.cancel()
-        _state.update { it.copy(path = NasPath.clean(path), loading = true, error = null, configured = true) }
+        _state.update {
+            it.copy(path = NasPath.clean(path), loading = true, error = null, configured = true, selected = emptySet())
+        }
         loadJob = viewModelScope.launch {
             try {
                 val entries = graph.nas.list(path)
@@ -150,6 +168,36 @@ class NasViewModel(app: Application) : AndroidViewModel(app) {
 
     fun refresh() = open(_state.value.path)
 
+    fun toggle(path: String) = _state.update {
+        it.copy(selected = if (path in it.selected) it.selected - path else it.selected + path)
+    }
+
+    fun selectAll() = _state.update { s -> s.copy(selected = s.entries.mapTo(HashSet()) { it.path }) }
+
+    fun clearSelection() = _state.update { it.copy(selected = emptySet()) }
+
+    /**
+     * Deletes files and folders (with their contents) from the NAS. Their photos are no
+     * longer counted as backed up, so any still on the phone are uploaded again next backup.
+     */
+    fun delete(entries: List<NasEntry>) {
+        if (entries.isEmpty() || _state.value.deleting) return
+        _state.update { it.copy(deleting = true) }
+        viewModelScope.launch {
+            val result = runCatching { graph.nas.delete(entries) }
+            // Forget every attempted path: if one survived, the next backup just finds it and re-records it.
+            withContext(Dispatchers.IO) { entries.forEach { graph.index.forgetRemote(it.path) } }
+            _state.update { it.copy(deleting = false, selected = emptySet()) }
+            messages.tryEmit(
+                result.fold(
+                    { n -> "Deleted $n ${if (n == 1) "item" else "items"} from the NAS" },
+                    { e -> "Delete failed: ${NasClient.describe(e)}" },
+                )
+            )
+            refresh()
+        }
+    }
+
     /**
      * Saves a NAS photo or video to the phone's gallery as a background job, so it
      * finishes even if the app is closed. It goes back to its original folder when possible.
@@ -168,6 +216,7 @@ class NasViewModel(app: Application) : AndroidViewModel(app) {
                 val running = active.firstOrNull { it.state == WorkInfo.State.RUNNING }
                 val size = running?.progress?.getLong(DownloadWorker.KEY_SIZE, 0) ?: 0
                 val bytes = running?.progress?.getLong(DownloadWorker.KEY_BYTES, 0) ?: 0
+                val rate = running?.progress?.getLong(DownloadWorker.KEY_RATE, 0) ?: 0
                 _state.update {
                     it.copy(
                         downloading = when (active.size) {
@@ -176,6 +225,7 @@ class NasViewModel(app: Application) : AndroidViewModel(app) {
                             else -> "${active.size} files"
                         },
                         downloadProgress = if (size > 0) (bytes.toFloat() / size).coerceIn(0f, 1f) else null,
+                        downloadRate = rate,
                     )
                 }
                 val finished = infos.filter { it.state.isFinished }
@@ -210,13 +260,30 @@ fun NasScreen(onOpenSettings: () -> Unit, vm: NasViewModel = viewModel()) {
     val viewMode by vm.viewMode.collectAsStateWithLifecycle()
     val snackbar = remember { SnackbarHostState() }
     var preview by remember { mutableStateOf<NasEntry?>(null) }
+    var confirmDelete by remember { mutableStateOf<List<NasEntry>?>(null) }
+    val selecting = state.selected.isNotEmpty()
     LaunchedEffect(Unit) { vm.start() }
     LaunchedEffect(Unit) { vm.messages.collect { snackbar.showSnackbar(it) } }
-    BackHandler(enabled = state.path.isNotEmpty()) { vm.up() }
+    BackHandler(enabled = state.path.isNotEmpty() && !selecting) { vm.up() }
+    BackHandler(enabled = selecting) { vm.clearSelection() }
 
     Scaffold(
         topBar = {
-            TopAppBar(
+            if (selecting) {
+                TopAppBar(
+                    navigationIcon = {
+                        IconButton(onClick = vm::clearSelection) { Icon(Icons.Filled.Close, "Clear selection") }
+                    },
+                    title = { Text("${state.selected.size} selected") },
+                    actions = {
+                        IconButton(onClick = vm::selectAll) { Icon(Icons.Filled.SelectAll, "Select all") }
+                        IconButton(
+                            onClick = { confirmDelete = state.entries.filter { it.path in state.selected } },
+                            enabled = !state.deleting,
+                        ) { Icon(Icons.Filled.Delete, "Delete from NAS") }
+                    },
+                )
+            } else TopAppBar(
                 navigationIcon = {
                     if (state.path.isNotEmpty()) {
                         IconButton(onClick = { vm.up() }) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Up") }
@@ -242,13 +309,15 @@ fun NasScreen(onOpenSettings: () -> Unit, vm: NasViewModel = viewModel()) {
         Column(Modifier.padding(padding)) {
             val progress = state.downloadProgress
             when {
+                state.deleting -> LinearProgressIndicator(Modifier.fillMaxWidth())
                 state.downloading != null && progress != null ->
                     LinearProgressIndicator(progress = { progress }, modifier = Modifier.fillMaxWidth())
                 state.loading || state.downloading != null -> LinearProgressIndicator(Modifier.fillMaxWidth())
             }
             state.downloading?.let {
                 Text(
-                    "Saving $it to the phone" + (progress?.let { p -> " · ${(p * 100).toInt()}%" } ?: "…"),
+                    "Saving $it to the phone" + (progress?.let { p -> " · ${(p * 100).toInt()}%" } ?: "…") +
+                        (if (state.downloadRate > 0) " · " + formatSize(state.downloadRate) + "/s" else ""),
                     style = MaterialTheme.typography.bodySmall,
                     modifier = Modifier.padding(16.dp, 4.dp),
                 )
@@ -274,13 +343,15 @@ fun NasScreen(onOpenSettings: () -> Unit, vm: NasViewModel = viewModel()) {
                 else -> {
                     val onOpen: (NasEntry) -> Unit = { e ->
                         when {
+                            selecting -> vm.toggle(e.path)
                             e.isDirectory -> vm.open(e.path)
                             e.isImage || e.isVideo -> preview = e
                         }
                     }
+                    val onSelect: (NasEntry) -> Unit = { vm.toggle(it.path) }
                     when (viewMode) {
-                        ViewMode.Thumbnails -> NasGrid(state.entries, onOpen)
-                        ViewMode.Details -> NasList(state.entries, onOpen)
+                        ViewMode.Thumbnails -> NasGrid(state.entries, state.selected, onOpen, onSelect)
+                        ViewMode.Details -> NasList(state.entries, state.selected, onOpen, onSelect)
                     }
                 }
             }
@@ -307,13 +378,55 @@ fun NasScreen(onOpenSettings: () -> Unit, vm: NasViewModel = viewModel()) {
             confirmButton = {
                 TextButton(onClick = { vm.download(e); preview = null }) { Text("Save to phone") }
             },
-            dismissButton = { TextButton(onClick = { preview = null }) { Text("Close") } },
+            dismissButton = {
+                Row {
+                    TextButton(onClick = { confirmDelete = listOf(e); preview = null }) { Text("Delete") }
+                    TextButton(onClick = { preview = null }) { Text("Close") }
+                }
+            },
+        )
+    }
+
+    confirmDelete?.let { targets ->
+        val folders = targets.count { it.isDirectory }
+        val files = targets.size - folders
+        AlertDialog(
+            onDismissRequest = { confirmDelete = null },
+            icon = { Icon(Icons.Filled.Delete, null) },
+            title = {
+                Text(
+                    if (targets.size == 1) "Delete \"${targets[0].name}\" from the NAS?"
+                    else "Delete ${targets.size} items from the NAS?"
+                )
+            },
+            text = {
+                Text(
+                    buildString {
+                        if (folders > 0) append("Folders are deleted with everything in them. ")
+                        append("This can't be undone from the app. ")
+                        append("Photos and videos still on this phone will be uploaded again on the next backup.")
+                        if (targets.size > 1) append("\n\n$files ${if (files == 1) "file" else "files"}, $folders ${if (folders == 1) "folder" else "folders"}")
+                    }
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = { vm.delete(targets); confirmDelete = null }) {
+                    Text("Delete", color = MaterialTheme.colorScheme.error)
+                }
+            },
+            dismissButton = { TextButton(onClick = { confirmDelete = null }) { Text("Cancel") } },
         )
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun NasGrid(entries: List<NasEntry>, onOpen: (NasEntry) -> Unit) {
+private fun NasGrid(
+    entries: List<NasEntry>,
+    selected: Set<String>,
+    onOpen: (NasEntry) -> Unit,
+    onSelect: (NasEntry) -> Unit,
+) {
     val context = LocalContext.current
     LazyVerticalGrid(
         columns = GridCells.Adaptive(110.dp),
@@ -323,9 +436,11 @@ private fun NasGrid(entries: List<NasEntry>, onOpen: (NasEntry) -> Unit) {
         modifier = Modifier.fillMaxSize(),
     ) {
         items(entries, key = { it.path }) { e ->
-            Column(Modifier.clickable { onOpen(e) }) {
+            val isSelected = e.path in selected
+            Column(Modifier.combinedClickable(onClick = { onOpen(e) }, onLongClick = { onSelect(e) })) {
                 Box(
-                    Modifier.aspectRatio(1f).fillMaxWidth().background(MaterialTheme.colorScheme.surfaceVariant),
+                    Modifier.aspectRatio(1f).fillMaxWidth().background(MaterialTheme.colorScheme.surfaceVariant)
+                        .padding(if (isSelected) 8.dp else 0.dp),
                     contentAlignment = Alignment.Center,
                 ) {
                     when {
@@ -346,6 +461,13 @@ private fun NasGrid(entries: List<NasEntry>, onOpen: (NasEntry) -> Unit) {
                         e.isVideo -> Icon(Icons.Filled.Movie, null, Modifier.size(40.dp))
                         else -> Icon(Icons.Filled.InsertDriveFile, null, Modifier.size(40.dp))
                     }
+                    if (isSelected) {
+                        Icon(
+                            Icons.Filled.CheckCircle, "Selected", tint = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.align(Alignment.TopStart)
+                                .background(MaterialTheme.colorScheme.surface, CircleShape),
+                        )
+                    }
                 }
                 Text(
                     e.name, style = MaterialTheme.typography.bodySmall, maxLines = 1, overflow = TextOverflow.Ellipsis,
@@ -356,13 +478,25 @@ private fun NasGrid(entries: List<NasEntry>, onOpen: (NasEntry) -> Unit) {
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun NasList(entries: List<NasEntry>, onOpen: (NasEntry) -> Unit) {
+private fun NasList(
+    entries: List<NasEntry>,
+    selected: Set<String>,
+    onOpen: (NasEntry) -> Unit,
+    onSelect: (NasEntry) -> Unit,
+) {
     val context = LocalContext.current
     LazyColumn(Modifier.fillMaxSize()) {
         items(entries, key = { it.path }) { e ->
+            val isSelected = e.path in selected
             ListItem(
-                modifier = Modifier.clickable { onOpen(e) },
+                modifier = Modifier.combinedClickable(onClick = { onOpen(e) }, onLongClick = { onSelect(e) }),
+                colors = if (isSelected) ListItemDefaults.colors(containerColor = MaterialTheme.colorScheme.secondaryContainer)
+                else ListItemDefaults.colors(),
+                trailingContent = if (selected.isNotEmpty()) {
+                    { Checkbox(checked = isSelected, onCheckedChange = { onSelect(e) }) }
+                } else null,
                 leadingContent = {
                     Box(
                         Modifier.size(48.dp).background(MaterialTheme.colorScheme.surfaceVariant),

@@ -22,11 +22,20 @@ To install it, open the APK on your phone. If Android asks, allow your browser o
 
 - **Device tab:** browse your photos and videos by album. Anything already on the NAS has a cloud badge. Long-press to select items and upload just those.
 - **NAS tab:** browse the share and save any photo or video back to your phone.
+- **Move to NAS:** select photos and videos and move them off the phone. Each file is uploaded, then read back from the NAS and compared byte for byte (SHA-256). Only exact matches are deleted from the phone, after you confirm in Android's dialog. Moves are manual only and can't be scheduled.
+- **Delete:** long-press to select, then delete.
+  - **On the phone:** frees up space; the NAS copy stays. You're warned if something isn't backed up yet.
+  - **On the NAS:** files or whole folders. Anything still on the phone is uploaded again on the next backup.
 - **Thumbnails or details:** switch either tab between a grid and a list showing date, size and backup status.
 - **Automatic backup:** new photos are uploaded shortly after you take them, and a full check runs every 6 hours.
-- **Scheduled backup:** back up everything at a time you choose (for example 2:00 AM) on the days you pick. Android may start it a few minutes late if the phone is idle.
-- **Conditions:** both kinds can be limited to Wi-Fi only or charging only, and to the albums you choose.
-- **Progress:** one bar for the current file (bytes sent) and one for the whole job.
+- **Scheduled backup:** back up everything at a time you choose (for example 2:00 AM) on the days you pick. Android may start it a few minutes late if the phone is idle. A silent notification shows while it runs, then is replaced by a report, e.g. "12 files uploaded in 3 min" or why it was skipped or failed.
+- **Conditions:** both kinds can be limited to Wi-Fi only or charging only, and to the albums you choose. Wi-Fi only can be narrowed further to specific networks by name, so backups only run at home.
+- **Progress:** one bar for the current file (bytes sent) and one for the whole job, with the current transfer rate.
+- **Skips what's already there:** each NAS folder is listed once per run. Uploaded copies carry the phone file's modified time, so a file with the same name, size and time is skipped without any extra transfer. Only same-size files with a different time are compared by content (SHA-256).
+- **Check backups** (Settings → Maintenance): confirms everything marked as backed up is really on the NAS.
+  - **Quick** checks names and sizes, in seconds.
+  - **Full** reads every file back and compares it byte for byte.
+  - Optionally re-uploads anything missing or damaged. Nothing on the NAS is ever deleted.
 - **Your choice of folder:** you choose the destination folder on the NAS, and the app creates folders there if needed.
 - **Safe uploads:** each file is written under a temporary name and renamed only once complete, so an interrupted upload never looks finished. Photo location (GPS) data is kept.
 
@@ -84,6 +93,7 @@ Allow the photo, video and notification permissions when asked. Allowing access 
 | Notifications | Long uploads and downloads run as a foreground service, which shows a progress notification |
 | Unrestricted battery use | Otherwise Android's Doze can hold back scheduled backups for hours |
 | Background activity not restricted | If it's restricted, Android won't run backups when the app is closed |
+| Location "all the time" and location on *(only if you limit backups to named Wi-Fi networks)* | Android only reveals the Wi-Fi name to apps with location access. uPhotoSync doesn't use or store your location. |
 
 Backups and **Save to phone** downloads keep going after you leave the app, and schedules survive a reboot.
 

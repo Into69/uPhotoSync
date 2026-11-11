@@ -90,6 +90,23 @@ class BackupIndex(context: Context) :
         _sizes.update { it - ids.toSet() }
     }
 
+    /**
+     * Forgets uploads stored at [path] on the NAS, or anywhere under it if it's a folder,
+     * after they were deleted there. Their photos show as not backed up straight away.
+     */
+    fun forgetRemote(path: String) {
+        ensureLoaded()
+        val clean = NasPath.clean(path)
+        // SMB paths are case-insensitive. ESCAPE keeps _ and % in names literal.
+        val escaped = clean.lowercase().replace("!", "!!").replace("%", "!%").replace("_", "!_")
+        val removed = ArrayList<Long>()
+        readableDatabase.rawQuery(
+            "SELECT media_id FROM backed_up WHERE lower(remote_path) = ? OR lower(remote_path) LIKE ? ESCAPE '!'",
+            arrayOf(clean.lowercase(), "$escaped\\%"),
+        ).use { c -> while (c.moveToNext()) removed += c.getLong(0) }
+        remove(removed)
+    }
+
     @Synchronized
     fun clear() {
         writableDatabase.delete("backed_up", null, null)

@@ -6,6 +6,7 @@ import android.app.ActivityManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.location.LocationManager
 import android.net.Uri
 import android.os.Build
 import android.os.PowerManager
@@ -75,11 +76,29 @@ object AppPermissions {
     fun backgroundRestricted(context: Context): Boolean =
         context.getSystemService(ActivityManager::class.java).isBackgroundRestricted
 
-    fun readyForBackground(context: Context) =
+    /** Precise location: Android's gate for reading the Wi-Fi name (SSID). */
+    fun preciseLocation(context: Context) = granted(context, Manifest.permission.ACCESS_FINE_LOCATION)
+
+    /** "Allow all the time": needed for background backups to read the Wi-Fi name. */
+    fun backgroundLocation(context: Context) = granted(context, Manifest.permission.ACCESS_BACKGROUND_LOCATION)
+
+    /** The system location switch; with it off, Android hides the Wi-Fi name. */
+    fun locationEnabled(context: Context) =
+        context.getSystemService(LocationManager::class.java).isLocationEnabled
+
+    /** Everything needed to read the Wi-Fi name from a background backup. */
+    fun wifiNameReadable(context: Context) =
+        preciseLocation(context) && backgroundLocation(context) && locationEnabled(context)
+
+    /** [needsWifiName]: automatic backups are limited to named Wi-Fi networks. */
+    fun readyForBackground(context: Context, needsWifiName: Boolean = false) =
         mediaAccess(context) == MediaAccess.Full &&
             notificationsAllowed(context) &&
             batteryUnrestricted(context) &&
-            !backgroundRestricted(context)
+            !backgroundRestricted(context) &&
+            (!needsWifiName || wifiNameReadable(context))
+
+    fun locationSettingsIntent() = Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS)
 
     // A sideloaded backup app is the intended use of this exemption.
     @SuppressLint("BatteryLife")
