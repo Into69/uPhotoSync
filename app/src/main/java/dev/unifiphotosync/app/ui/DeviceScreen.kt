@@ -1,11 +1,8 @@
 package dev.unifiphotosync.app.ui
 
-import android.Manifest
 import android.app.Application
 import android.content.Intent
-import android.content.pm.PackageManager
 import android.database.ContentObserver
-import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.provider.MediaStore
@@ -25,6 +22,11 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.material3.Surface
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LifecycleEventEffect
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.items
@@ -72,7 +74,6 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
-import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewModelScope
@@ -183,34 +184,27 @@ class DeviceViewModel(app: Application) : AndroidViewModel(app) {
     }
 }
 
-private fun mediaPermissions(): Array<String> = buildList {
-    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-        add(Manifest.permission.READ_MEDIA_IMAGES)
-        add(Manifest.permission.READ_MEDIA_VIDEO)
-        add(Manifest.permission.POST_NOTIFICATIONS)
-    } else {
-        add(Manifest.permission.READ_EXTERNAL_STORAGE)
-    }
-    add(Manifest.permission.ACCESS_MEDIA_LOCATION)
-}.toTypedArray()
-
-private fun readPermission() =
-    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) Manifest.permission.READ_MEDIA_IMAGES
-    else Manifest.permission.READ_EXTERNAL_STORAGE
-
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun DeviceScreen(onOpenSettings: () -> Unit, vm: DeviceViewModel = viewModel()) {
     val context = LocalContext.current
-    var granted by remember {
-        mutableStateOf(ContextCompat.checkSelfPermission(context, readPermission()) == PackageManager.PERMISSION_GRANTED)
+    var access by remember { mutableStateOf(AppPermissions.mediaAccess(context)) }
+    val granted = access != MediaAccess.None
+    val launcher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
+        access = AppPermissions.mediaAccess(context)
+        if (access != MediaAccess.None) vm.reload()
     }
-    val launcher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { result ->
-        granted = result[readPermission()] == true ||
-            ContextCompat.checkSelfPermission(context, readPermission()) == PackageManager.PERMISSION_GRANTED
-        if (granted) vm.reload()
+    LaunchedEffect(Unit) {
+        if (granted) vm.reload() else launcher.launch(AppPermissions.firstLaunchRequest())
     }
-    LaunchedEffect(Unit) { if (granted) vm.reload() else launcher.launch(mediaPermissions()) }
+    // Access can change in system settings while the app is in the background.
+    LifecycleEventEffect(Lifecycle.Event.ON_RESUME) {
+        val now = AppPermissions.mediaAccess(context)
+        if (now != access) {
+            access = now
+            if (now != MediaAccess.None) vm.reload()
+        }
+    }
 
     val state by vm.state.collectAsStateWithLifecycle()
     val viewMode by vm.viewMode.collectAsStateWithLifecycle()
@@ -271,8 +265,20 @@ fun DeviceScreen(onOpenSettings: () -> Unit, vm: DeviceViewModel = viewModel()) 
     ) { padding ->
         Column(Modifier.padding(padding)) {
             BackupStatusBanner()
+            if (access == MediaAccess.Partial) {
+                Surface(color = MaterialTheme.colorScheme.errorContainer, modifier = Modifier.fillMaxWidth()) {
+                    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(start = 16.dp, end = 8.dp)) {
+                        Text(
+                            "Only some photos are allowed, so only those are shown and backed up.",
+                            style = MaterialTheme.typography.bodySmall,
+                            modifier = Modifier.weight(1f).padding(vertical = 8.dp),
+                        )
+                        TextButton(onClick = { launcher.launch(AppPermissions.mediaRequest()) }) { Text("Allow all") }
+                    }
+                }
+            }
             when {
-                !granted -> PermissionPrompt { launcher.launch(mediaPermissions()) }
+                !granted -> PermissionPrompt { launcher.launch(AppPermissions.firstLaunchRequest()) }
                 !state.loading && state.items.isEmpty() -> CenterText("No photos or videos found")
                 else -> {
                     val onClick: (MediaItem) -> Unit = { item ->

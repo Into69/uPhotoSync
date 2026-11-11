@@ -1,11 +1,6 @@
 package dev.unifiphotosync.app.ui
 
 import android.app.Application
-import android.content.ContentUris
-import android.content.ContentValues
-import android.os.Environment
-import android.provider.MediaStore
-import android.webkit.MimeTypeMap
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -69,11 +64,13 @@ import coil.compose.AsyncImage
 import coil.request.ImageRequest
 import dev.unifiphotosync.app.PhotoSyncApp
 import dev.unifiphotosync.app.data.NasPath
+import androidx.work.WorkInfo
+import dev.unifiphotosync.app.backup.DownloadWorker
 import dev.unifiphotosync.app.smb.NasClient
+import java.util.UUID
 import dev.unifiphotosync.app.smb.NasEntry
 import dev.unifiphotosync.app.smb.NasFile
 import dev.unifiphotosync.app.smb.NasNotConfiguredException
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -81,7 +78,6 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 
 data class NasUiState(
     val configured: Boolean = true,
@@ -89,7 +85,10 @@ data class NasUiState(
     val entries: List<NasEntry> = emptyList(),
     val loading: Boolean = false,
     val error: String? = null,
+    /** What's being saved to the phone (a file name or "3 files"), if anything. */
     val downloading: String? = null,
+    /** Progress of the running download, when its size is known. */
+    val downloadProgress: Float? = null,
 )
 
 class NasViewModel(app: Application) : AndroidViewModel(app) {
@@ -151,42 +150,57 @@ class NasViewModel(app: Application) : AndroidViewModel(app) {
 
     fun refresh() = open(_state.value.path)
 
-    /** Copies a NAS photo or video into the phone's gallery (Pictures/ or Movies/uPhotoSync). */
+    /**
+     * Saves a NAS photo or video to the phone's gallery as a background job, so it
+     * finishes even if the app is closed. It goes back to its original folder when possible.
+     */
     fun download(entry: NasEntry) {
-        if (_state.value.downloading != null) return
-        _state.update { it.copy(downloading = entry.name) }
+        graph.scheduler.download(entry)
+        messages.tryEmit("Saving ${entry.name} to the phone…")
+    }
+
+    init {
+        // Show running downloads, and say when each one finishes.
         viewModelScope.launch {
-            val result = runCatching { saveToGallery(entry) }
-            _state.update { it.copy(downloading = null) }
-            messages.tryEmit(
-                result.fold({ "Saved ${entry.name} to the gallery" }, { "Download failed: ${it.message}" })
-            )
+            var reported: Set<UUID>? = null
+            graph.scheduler.downloads.collect { infos ->
+                val active = infos.filter { !it.state.isFinished }
+                val running = active.firstOrNull { it.state == WorkInfo.State.RUNNING }
+                val size = running?.progress?.getLong(DownloadWorker.KEY_SIZE, 0) ?: 0
+                val bytes = running?.progress?.getLong(DownloadWorker.KEY_BYTES, 0) ?: 0
+                _state.update {
+                    it.copy(
+                        downloading = when (active.size) {
+                            0 -> null
+                            1 -> fileName(active[0])
+                            else -> "${active.size} files"
+                        },
+                        downloadProgress = if (size > 0) (bytes.toFloat() / size).coerceIn(0f, 1f) else null,
+                    )
+                }
+                val finished = infos.filter { it.state.isFinished }
+                // The first emission includes old results; only report ones that finish from now on.
+                reported?.let { seen ->
+                    finished.filter { it.id !in seen }.forEach { info ->
+                        val name = fileName(info)
+                        messages.tryEmit(
+                            when (info.state) {
+                                WorkInfo.State.SUCCEEDED -> "Saved $name to the gallery"
+                                WorkInfo.State.CANCELLED -> "Cancelled saving $name"
+                                else -> "Couldn't save $name: " +
+                                    (info.outputData.getString(DownloadWorker.KEY_ERROR) ?: "unknown error")
+                            }
+                        )
+                    }
+                }
+                reported = finished.mapTo(HashSet()) { it.id }
+            }
         }
     }
 
-    private suspend fun saveToGallery(entry: NasEntry) = withContext(Dispatchers.IO) {
-        val resolver = getApplication<Application>().contentResolver
-        val mime = MimeTypeMap.getSingleton().getMimeTypeFromExtension(entry.extension)
-            ?: if (entry.isVideo) "video/mp4" else "image/jpeg"
-        val collection = if (entry.isVideo) MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
-        else MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
-        val dir = if (entry.isVideo) Environment.DIRECTORY_MOVIES else Environment.DIRECTORY_PICTURES
-        val uri = resolver.insert(collection, ContentValues().apply {
-            put(MediaStore.MediaColumns.DISPLAY_NAME, entry.name)
-            put(MediaStore.MediaColumns.MIME_TYPE, mime)
-            put(MediaStore.MediaColumns.RELATIVE_PATH, "$dir/uPhotoSync")
-            put(MediaStore.MediaColumns.IS_PENDING, 1)
-        }) ?: error("Couldn't create the file")
-        try {
-            resolver.openOutputStream(uri)?.use { graph.nas.download(entry.path, it) } ?: error("Couldn't write the file")
-            resolver.update(uri, ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }, null, null)
-            // It came from the NAS, so it's already backed up — don't upload it again.
-            graph.index.mark(ContentUris.parseId(uri), entry.path, entry.size)
-        } catch (e: Exception) {
-            resolver.delete(uri, null, null)
-            throw e
-        }
-    }
+    private fun fileName(info: WorkInfo) =
+        info.tags.firstOrNull { it.startsWith(DownloadWorker.TAG_FILE_PREFIX) }
+            ?.removePrefix(DownloadWorker.TAG_FILE_PREFIX) ?: "file"
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -226,9 +240,18 @@ fun NasScreen(onOpenSettings: () -> Unit, vm: NasViewModel = viewModel()) {
         snackbarHost = { SnackbarHost(snackbar) },
     ) { padding ->
         Column(Modifier.padding(padding)) {
-            if (state.loading || state.downloading != null) LinearProgressIndicator(Modifier.fillMaxWidth())
+            val progress = state.downloadProgress
+            when {
+                state.downloading != null && progress != null ->
+                    LinearProgressIndicator(progress = { progress }, modifier = Modifier.fillMaxWidth())
+                state.loading || state.downloading != null -> LinearProgressIndicator(Modifier.fillMaxWidth())
+            }
             state.downloading?.let {
-                Text("Downloading $it…", style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(16.dp, 4.dp))
+                Text(
+                    "Saving $it to the phone" + (progress?.let { p -> " · ${(p * 100).toInt()}%" } ?: "…"),
+                    style = MaterialTheme.typography.bodySmall,
+                    modifier = Modifier.padding(16.dp, 4.dp),
+                )
             }
             when {
                 !state.configured -> Column(

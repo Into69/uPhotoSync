@@ -23,6 +23,7 @@ import androidx.compose.material.icons.filled.Storage
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.ListItem
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextOverflow
 import dev.unifiphotosync.app.data.NasPath
 import dev.unifiphotosync.app.smb.NasClient
@@ -258,6 +259,14 @@ fun SettingsScreen(vm: SettingsViewModel = viewModel()) {
     val message by vm.message.collectAsStateWithLifecycle()
     val picker by vm.picker.collectAsStateWithLifecycle()
     var confirmReset by remember { mutableStateOf(false) }
+    val context = LocalContext.current
+    var askBackground by remember { mutableStateOf(false) }
+    // Turning on automatic or scheduled backup: make sure Android will let it run.
+    val setPrefs: (BackupPrefs) -> Unit = { p ->
+        val turningOn = (p.autoBackup && !prefs.autoBackup) || (p.scheduled && !prefs.scheduled)
+        if (turningOn && !AppPermissions.readyForBackground(context)) askBackground = true
+        vm.setPrefs(p)
+    }
 
     Scaffold(topBar = { TopAppBar(title = { Text("Settings") }) }) { padding ->
         Column(Modifier.padding(padding).fillMaxSize()) {
@@ -283,11 +292,18 @@ fun SettingsScreen(vm: SettingsViewModel = viewModel()) {
 
                 HorizontalDivider(Modifier.padding(vertical = 8.dp))
                 Section("Automatic backup")
-                ToggleRow("Back up new photos automatically", prefs.autoBackup) { vm.setPrefs(prefs.copy(autoBackup = it)) }
-                ToggleRow("Only on Wi-Fi / unmetered networks", prefs.unmeteredOnly, enabled = prefs.autoBackup) {
+                ToggleRow("Back up new photos automatically", prefs.autoBackup) { setPrefs(prefs.copy(autoBackup = it)) }
+                ScheduleSettings(prefs, setPrefs)
+                Text(
+                    "These apply to both automatic and scheduled backups:",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(top = 8.dp),
+                )
+                ToggleRow("Only on Wi-Fi / unmetered networks", prefs.unmeteredOnly, enabled = prefs.anyAutomatic) {
                     vm.setPrefs(prefs.copy(unmeteredOnly = it))
                 }
-                ToggleRow("Only while charging", prefs.chargingOnly, enabled = prefs.autoBackup) {
+                ToggleRow("Only while charging", prefs.chargingOnly, enabled = prefs.anyAutomatic) {
                     vm.setPrefs(prefs.copy(chargingOnly = it))
                 }
                 Text(
@@ -300,7 +316,7 @@ fun SettingsScreen(vm: SettingsViewModel = viewModel()) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Checkbox(
                             checked = checked,
-                            enabled = prefs.autoBackup,
+                            enabled = prefs.anyAutomatic,
                             onCheckedChange = { on ->
                                 // An empty set means "all"; materialize it before removing one.
                                 val current = prefs.albums.ifEmpty { albums.mapTo(HashSet()) { it.id } }
@@ -312,6 +328,15 @@ fun SettingsScreen(vm: SettingsViewModel = viewModel()) {
                         Text("${a.name} (${a.count})")
                     }
                 }
+
+                HorizontalDivider(Modifier.padding(vertical = 8.dp))
+                Section("Background access")
+                Text(
+                    "What Android needs to allow so backups and downloads keep running when the app is closed.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                BackgroundAccessPanel()
 
                 HorizontalDivider(Modifier.padding(vertical = 8.dp))
                 Section("Maintenance")
@@ -334,6 +359,8 @@ fun SettingsScreen(vm: SettingsViewModel = viewModel()) {
             onDismiss = vm::closePicker,
         )
     }
+
+    if (askBackground) BackgroundAccessDialog(onDismiss = { askBackground = false })
 
     if (confirmReset) {
         AlertDialog(
@@ -381,7 +408,7 @@ private fun ConnectionForm(c: NasConfig, onChange: (NasConfig) -> Unit, onBrowse
         onValueChange = { onChange(c.copy(destination = it)) },
         label = { Text("Destination folder in the share") },
         placeholder = { Text("Share root") },
-        supportingText = { Text("Photos are filed into year/month folders inside it") },
+        supportingText = { Text("Phone folders are copied inside it, e.g. DCIM/Camera") },
         singleLine = true,
         trailingIcon = { IconButton(onClick = onBrowse) { Icon(Icons.Filled.FolderOpen, "Browse NAS folders") } },
         modifier = Modifier.fillMaxWidth(),

@@ -3,6 +3,7 @@ package dev.unifiphotosync.app.data
 import android.content.Context
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
+import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.core.stringSetPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
@@ -57,7 +58,16 @@ data class BackupPrefs(
     val chargingOnly: Boolean = false,
     /** MediaStore bucket ids to auto back up; empty means every album. */
     val albums: Set<String> = emptySet(),
-)
+    /** Daily backup at a set time, on [scheduleDays]. */
+    val scheduled: Boolean = false,
+    /** Minutes after midnight, local time. */
+    val scheduleMinutes: Int = 2 * 60,
+    /** ISO days of week (1 = Monday ... 7 = Sunday). */
+    val scheduleDays: Set<Int> = (1..7).toSet(),
+) {
+    /** The Wi-Fi/charging/album options matter when either kind of automatic backup is on. */
+    val anyAutomatic get() = autoBackup || scheduled
+}
 
 class SettingsStore(private val context: Context) {
     private object Keys {
@@ -71,6 +81,9 @@ class SettingsStore(private val context: Context) {
         val unmeteredOnly = booleanPreferencesKey("unmetered_only")
         val chargingOnly = booleanPreferencesKey("charging_only")
         val albums = stringSetPreferencesKey("albums")
+        val scheduled = booleanPreferencesKey("scheduled")
+        val scheduleMinutes = intPreferencesKey("schedule_minutes")
+        val scheduleDays = stringSetPreferencesKey("schedule_days")
     }
 
     /** Thumbnails or details for a browser screen, remembered per [screen] ("device", "nas"). */
@@ -105,6 +118,9 @@ class SettingsStore(private val context: Context) {
             unmeteredOnly = p[Keys.unmeteredOnly] ?: true,
             chargingOnly = p[Keys.chargingOnly] ?: false,
             albums = p[Keys.albums] ?: emptySet(),
+            scheduled = p[Keys.scheduled] ?: false,
+            scheduleMinutes = p[Keys.scheduleMinutes] ?: 2 * 60,
+            scheduleDays = p[Keys.scheduleDays]?.mapNotNull { it.toIntOrNull() }?.toSet() ?: (1..7).toSet(),
         )
     }
 
@@ -125,6 +141,9 @@ class SettingsStore(private val context: Context) {
             p[Keys.unmeteredOnly] = b.unmeteredOnly
             p[Keys.chargingOnly] = b.chargingOnly
             p[Keys.albums] = b.albums
+            p[Keys.scheduled] = b.scheduled
+            p[Keys.scheduleMinutes] = b.scheduleMinutes
+            p[Keys.scheduleDays] = b.scheduleDays.mapTo(HashSet()) { it.toString() }
         }
     }
 }

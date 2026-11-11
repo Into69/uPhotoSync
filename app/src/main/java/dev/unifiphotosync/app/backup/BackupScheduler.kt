@@ -14,9 +14,12 @@ import androidx.work.WorkInfo
 import androidx.work.WorkManager
 import androidx.work.workDataOf
 import dev.unifiphotosync.app.data.BackupPrefs
+import dev.unifiphotosync.app.smb.NasEntry
 import kotlinx.coroutines.flow.Flow
 import java.io.File
 import java.time.Duration
+import java.time.LocalDateTime
+import java.time.ZoneId
 import java.util.UUID
 import java.util.concurrent.TimeUnit
 
@@ -35,7 +38,12 @@ sealed interface BackupScope {
 class BackupScheduler(private val context: Context) {
     private val wm = WorkManager.getInstance(context)
 
+    /**
+     * [replaceTrigger] is true when settings change. It's false at app start, which only
+     * restores missing work, so a scheduled run that's due but waiting isn't pushed to tomorrow.
+     */
     fun apply(prefs: BackupPrefs, replaceTrigger: Boolean = true) {
+        if (replaceTrigger || !prefs.scheduled || !hasPendingSchedule()) applySchedule(prefs)
         if (!prefs.autoBackup) {
             wm.cancelUniqueWork(PERIODIC)
             wm.cancelUniqueWork(TRIGGER)
@@ -49,6 +57,32 @@ class BackupScheduler(private val context: Context) {
         wm.enqueueUniquePeriodicWork(PERIODIC, ExistingPeriodicWorkPolicy.UPDATE, periodic)
         enqueueTrigger(prefs, if (replaceTrigger) ExistingWorkPolicy.REPLACE else ExistingWorkPolicy.KEEP)
     }
+
+    /**
+     * The daily backup at the user's chosen time. It's a 24-hour periodic job whose next
+     * run is pinned to the next chosen time and day. A plain periodic job would drift later
+     * each day, so each scheduled run calls this again to re-pin. Updating doesn't
+     * interrupt a run in progress.
+     */
+    fun applySchedule(prefs: BackupPrefs) {
+        val next = BackupSchedule.next(LocalDateTime.now(), prefs.scheduleMinutes, prefs.scheduleDays)
+        if (!prefs.scheduled || next == null) {
+            wm.cancelUniqueWork(SCHEDULED)
+            return
+        }
+        val nextMillis = next.atZone(ZoneId.systemDefault()).toInstant().toEpochMilli()
+        val request = PeriodicWorkRequestBuilder<BackupWorker>(24, TimeUnit.HOURS)
+            .setConstraints(autoConstraints(prefs).build())
+            .setNextScheduleTimeOverride(nextMillis)
+            .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 10, TimeUnit.MINUTES)
+            .setInputData(workDataOf(BackupWorker.KEY_SCHEDULED to true))
+            .addTag(TAG)
+            .build()
+        wm.enqueueUniquePeriodicWork(SCHEDULED, ExistingPeriodicWorkPolicy.UPDATE, request)
+    }
+
+    private fun hasPendingSchedule(): Boolean =
+        runCatching { wm.getWorkInfosForUniqueWork(SCHEDULED).get().any { !it.state.isFinished } }.getOrDefault(false)
 
     /** Called by a trigger run; appends so it doesn't cancel the run that's calling it. */
     fun queueNextTrigger(prefs: BackupPrefs) {
@@ -100,6 +134,27 @@ class BackupScheduler(private val context: Context) {
 
     fun cancelAll() = wm.cancelAllWorkByTag(TAG_MANUAL)
 
+    /** "Save to phone" in the background, so it finishes even if the app is closed. */
+    fun download(entry: NasEntry) {
+        val request = OneTimeWorkRequestBuilder<DownloadWorker>()
+            .setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build())
+            .setExpedited(OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
+            .setInputData(
+                workDataOf(
+                    DownloadWorker.KEY_PATH to entry.path,
+                    DownloadWorker.KEY_SIZE to entry.size,
+                    DownloadWorker.KEY_MODIFIED to entry.modifiedAt,
+                )
+            )
+            .addTag(DownloadWorker.TAG)
+            .addTag(DownloadWorker.TAG_FILE_PREFIX + entry.name)
+            .build()
+        // Independent jobs (not a chain), so one failed download doesn't cancel the rest.
+        wm.enqueue(request)
+    }
+
+    val downloads: Flow<List<WorkInfo>> = wm.getWorkInfosByTagFlow(DownloadWorker.TAG)
+
     val workInfos: Flow<List<WorkInfo>> = wm.getWorkInfosByTagFlow(TAG)
 
     private fun autoConstraints(prefs: BackupPrefs) = Constraints.Builder()
@@ -111,6 +166,7 @@ class BackupScheduler(private val context: Context) {
         const val TAG = "backup"
         const val TAG_MANUAL = "backup-manual-run"
         private const val PERIODIC = "backup-periodic"
+        private const val SCHEDULED = "backup-scheduled"
         private const val TRIGGER = "backup-trigger"
         private const val MANUAL = "backup-manual"
 

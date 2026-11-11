@@ -23,7 +23,9 @@ To install it, open the APK on your phone. If Android asks, allow your browser o
 - **Device tab:** browse your photos and videos by album. Anything already on the NAS has a cloud badge. Long-press to select items and upload just those.
 - **NAS tab:** browse the share and save any photo or video back to your phone.
 - **Thumbnails or details:** switch either tab between a grid and a list showing date, size and backup status.
-- **Automatic backup:** new photos are uploaded shortly after you take them, and a full check runs every 6 hours. You can limit it to Wi-Fi only or charging only, and choose which albums to include.
+- **Automatic backup:** new photos are uploaded shortly after you take them, and a full check runs every 6 hours.
+- **Scheduled backup:** back up everything at a time you choose (for example 2:00 AM) on the days you pick. Android may start it a few minutes late if the phone is idle.
+- **Conditions:** both kinds can be limited to Wi-Fi only or charging only, and to the albums you choose.
 - **Progress:** one bar for the current file (bytes sent) and one for the whole job.
 - **Your choice of folder:** you choose the destination folder on the NAS, and the app creates folders there if needed.
 - **Safe uploads:** each file is written under a temporary name and renamed only once complete, so an interrupted upload never looks finished. Photo location (GPS) data is kept.
@@ -40,11 +42,15 @@ uPhotoSync is a **one-way backup**, not a two-way sync. It never deletes anythin
 | Edit a photo on the phone | The edited version is uploaded |
 | Change the destination folder | Everything is uploaded to the new folder; the old copies are left alone |
 
-Files are filed by the date they were taken:
+The NAS mirrors the folders on your phone:
 
 ```
-\\<NAS>\<share>\<destination>\2026\11\IMG_20261110_143210.jpg
+Phone                              NAS
+DCIM/Camera/IMG_20261110.jpg   →   \\<NAS>\<share>\<destination>\DCIM\Camera\IMG_20261110.jpg
+Pictures/Screenshots/Shot.png  →   \\<NAS>\<share>\<destination>\Pictures\Screenshots\Shot.png
 ```
+
+**Save to phone** on the NAS tab puts a file back in the same phone folder (e.g. `DCIM/Camera`) when Android allows it. Otherwise it goes in `Pictures/uPhotoSync` or `Movies/uPhotoSync`.
 
 If a different file with the same name is already in that folder, the new one is saved with its ID added to the name instead of overwriting the existing file.
 
@@ -67,6 +73,19 @@ If a different file with the same name is already in that folder, the new one is
 You can also type or paste the location, for example `\\192.168.1.20\Photos\Phone`. The app splits it into the address, share and folder.
 
 Allow the photo, video and notification permissions when asked. Allowing access to photo location keeps GPS data in the backups.
+
+### 3. Let it run in the background
+
+**Settings → Background access** shows what Android needs to allow, with a button to fix each item. It also pops up when you switch on automatic or scheduled backup.
+
+| Item | Why it's needed |
+|---|---|
+| Access to **all** photos and videos | With "Select photos" (Android 14+), only the selected photos are backed up |
+| Notifications | Long uploads and downloads run as a foreground service, which shows a progress notification |
+| Unrestricted battery use | Otherwise Android's Doze can hold back scheduled backups for hours |
+| Background activity not restricted | If it's restricted, Android won't run backups when the app is closed |
+
+Backups and **Save to phone** downloads keep going after you leave the app, and schedules survive a reboot.
 
 ## Building from source
 

@@ -18,6 +18,8 @@ data class MediaItem(
     val takenAt: Long,
     val bucketId: String,
     val bucketName: String,
+    /** Folder on the phone, e.g. "DCIM/Camera"; backups mirror it on the NAS. */
+    val relativePath: String,
     val isVideo: Boolean,
 )
 
@@ -36,6 +38,7 @@ class MediaRepository(private val context: Context) {
             FileColumns.DATE_ADDED,
             FileColumns.BUCKET_ID,
             FileColumns.BUCKET_DISPLAY_NAME,
+            FileColumns.RELATIVE_PATH,
             FileColumns.MEDIA_TYPE,
         )
         val selection = "${FileColumns.MEDIA_TYPE} IN (?, ?)"
@@ -56,6 +59,7 @@ class MediaRepository(private val context: Context) {
             val iAdded = c.getColumnIndexOrThrow(FileColumns.DATE_ADDED)
             val iBucket = c.getColumnIndexOrThrow(FileColumns.BUCKET_ID)
             val iBucketName = c.getColumnIndexOrThrow(FileColumns.BUCKET_DISPLAY_NAME)
+            val iRelPath = c.getColumnIndexOrThrow(FileColumns.RELATIVE_PATH)
             val iType = c.getColumnIndexOrThrow(FileColumns.MEDIA_TYPE)
             while (c.moveToNext()) {
                 val id = c.getLong(iId)
@@ -72,6 +76,8 @@ class MediaRepository(private val context: Context) {
                     takenAt = taken,
                     bucketId = c.getString(iBucket) ?: "",
                     bucketName = c.getString(iBucketName) ?: "Other",
+                    relativePath = c.getString(iRelPath)?.trim('/')?.takeIf { it.isNotBlank() }
+                        ?: c.getString(iBucketName) ?: "Other",
                     isVideo = isVideo,
                 )
             }

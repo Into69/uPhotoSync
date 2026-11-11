@@ -18,10 +18,9 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import java.io.FileNotFoundException
 import java.io.InputStream
-import java.util.Calendar
 
 /**
- * Copies media to the NAS as <destination>/<yyyy>/<MM>/<name>. Runs are serialized,
+ * Copies media to the NAS as <destination>/<phone folder>/<name>, e.g. Backups/DCIM/Camera/IMG_1.jpg. Runs are serialized,
  * so a manual backup and the scheduled one never upload the same file twice at once.
  */
 class BackupEngine(
@@ -178,13 +177,10 @@ class BackupEngine(
             ?: throw FileNotFoundException(item.uri.toString())
     }
 
+    /** Mirrors the phone's folder: DCIM/Camera on the phone -> <destination>\DCIM\Camera on the NAS. */
     private fun remoteDir(config: NasConfig, item: MediaItem): String {
-        val cal = Calendar.getInstance().apply { timeInMillis = item.takenAt }
-        return NasPath.join(
-            config.destination,
-            "%04d".format(cal.get(Calendar.YEAR)),
-            "%02d".format(cal.get(Calendar.MONTH) + 1),
-        )
+        val folders = item.relativePath.split('/', '\\').filter { it.isNotBlank() }.map(NasPath::safeName)
+        return NasPath.join(config.destination, *folders.toTypedArray())
     }
 
     private companion object {

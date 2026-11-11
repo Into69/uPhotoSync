@@ -10,6 +10,7 @@ import dev.unifiphotosync.app.backup.BackupEngine
 import dev.unifiphotosync.app.backup.BackupScheduler
 import dev.unifiphotosync.app.data.BackupIndex
 import dev.unifiphotosync.app.data.MediaRepository
+import dev.unifiphotosync.app.data.Restorer
 import dev.unifiphotosync.app.data.SettingsStore
 import dev.unifiphotosync.app.smb.NasClient
 import dev.unifiphotosync.app.smb.NasFileFetcher
@@ -28,6 +29,7 @@ class AppGraph(app: Application) {
     val nas = NasClient(settings)
     val engine = BackupEngine(app, index, nas, settings)
     val scheduler = BackupScheduler(app)
+    val restorer = Restorer(app, nas, index, settings)
     val appScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 }
 

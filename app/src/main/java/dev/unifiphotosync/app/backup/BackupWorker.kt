@@ -18,6 +18,7 @@ import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.time.LocalDateTime
 
 class BackupWorker(context: Context, params: WorkerParameters) : CoroutineWorker(context, params) {
 
@@ -26,8 +27,17 @@ class BackupWorker(context: Context, params: WorkerParameters) : CoroutineWorker
     override suspend fun doWork(): Result {
         val fromTrigger = inputData.getBoolean(KEY_FROM_TRIGGER, false)
         val idsFile = inputData.getString(KEY_IDS_FILE)?.let(::File)
+        val scheduled = inputData.getBoolean(KEY_SCHEDULED, false)
+        var retrying = false
         try {
             if (graph.settings.config.first() == null) return Result.failure(workDataOf(KEY_ERROR to "NAS not set up"))
+            if (scheduled) {
+                // Daily job: only back up on the chosen days, near the chosen time.
+                val prefs = graph.settings.prefs.first()
+                if (!BackupSchedule.isDue(LocalDateTime.now(), prefs.scheduleMinutes, prefs.scheduleDays)) {
+                    return Result.success()
+                }
+            }
             // Long backups need a foreground service; if the OS refuses (background-start
             // limits on content-trigger runs), carry on as a normal job.
             runCatching { setForeground(foregroundInfo(0, 0, null)) }
@@ -51,7 +61,7 @@ class BackupWorker(context: Context, params: WorkerParameters) : CoroutineWorker
                 KEY_ERROR to summary.lastError,
             )
             return when {
-                summary.aborted && runAttemptCount < 3 -> Result.retry()
+                summary.aborted && runAttemptCount < 3 -> Result.retry().also { retrying = true }
                 summary.aborted -> Result.failure(out).also { idsFile?.delete() }
                 else -> Result.success(out).also { idsFile?.delete() }
             }
@@ -63,11 +73,17 @@ class BackupWorker(context: Context, params: WorkerParameters) : CoroutineWorker
         } catch (e: Exception) {
             // NAS unreachable before any upload started (e.g. while checking what's on it).
             val error = workDataOf(KEY_ERROR to NasClient.describe(e))
-            return if (runAttemptCount < 3) Result.retry() else Result.failure(error).also { idsFile?.delete() }
+            if (runAttemptCount < 3) {
+                retrying = true
+                return Result.retry()
+            }
+            return Result.failure(error).also { idsFile?.delete() }
         } finally {
-            // Content-URI triggers fire once; queue the next one behind this run.
-            if (fromTrigger) withContext(NonCancellable) {
-                graph.scheduler.queueNextTrigger(graph.settings.prefs.first())
+            withContext(NonCancellable) {
+                // Content-URI triggers fire once; queue the next one behind this run.
+                if (fromTrigger) graph.scheduler.queueNextTrigger(graph.settings.prefs.first())
+                // Pin the next daily run to the chosen time (a retry keeps its own backoff timing).
+                if (scheduled && !retrying) graph.scheduler.applySchedule(graph.settings.prefs.first())
             }
         }
     }
@@ -114,6 +130,7 @@ class BackupWorker(context: Context, params: WorkerParameters) : CoroutineWorker
         const val KEY_ALBUM = "album"
         const val KEY_IDS_FILE = "ids_file"
         const val KEY_FROM_TRIGGER = "from_trigger"
+        const val KEY_SCHEDULED = "scheduled"
         const val KEY_DONE = "done"
         const val KEY_TOTAL = "total"
         const val KEY_FAILED = "failed"
