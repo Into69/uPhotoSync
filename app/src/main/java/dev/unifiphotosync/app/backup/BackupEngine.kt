@@ -55,7 +55,14 @@ class BackupEngine(
         val phase: Phase = Phase.Upload,
         /** Current transfer rate, bytes per second (0 when nothing is moving). */
         val bytesPerSecond: Long = 0,
+        /** Every file being transferred right now (several with parallel uploads). */
+        val files: List<FileProgress> = emptyList(),
+        /** Bytes of the whole job processed so far and in total (0 if unknown), for the job bar and time left. */
+        val bytesDone: Long = 0,
+        val bytesTotal: Long = 0,
     )
+
+    data class FileProgress(val name: String, val sent: Long, val size: Long)
 
     data class Summary(
         val uploaded: Int,
@@ -135,7 +142,14 @@ class BackupEngine(
      * Progress shows every file in flight combined, so the "current file" bar still means
      * "how far along the files being sent right now are".
      */
-    private class UploadRun(private val total: Int, private val onProgress: suspend (Progress) -> Unit) {
+    private class UploadRun(
+        private val total: Int,
+        /** Sum of all pending files' sizes, so the job bar can move by bytes, not by file count. */
+        private val totalBytes: Long,
+        private val onProgress: suspend (Progress) -> Unit,
+    ) {
+        /** Bytes of files already finished, skipped or failed (whole file sizes). */
+        private var processedBytes = 0L
         private val mutex = Mutex()
         private val inFlight = LinkedHashMap<Long, Triple<String, Long, Long>>() // id -> name, sent, size
         private val meter = RateMeter()
@@ -173,6 +187,7 @@ class BackupEngine(
 
         suspend fun finished(item: MediaItem, sent: Boolean) = mutex.withLock {
             inFlight.remove(item.id)
+            processedBytes += item.size
             done++
             if (sent) uploaded++ else alreadyThere++
             consecutiveFailures = 0
@@ -181,12 +196,14 @@ class BackupEngine(
 
         suspend fun skipped(item: MediaItem) = mutex.withLock {
             inFlight.remove(item.id)
+            processedBytes += item.size
             done++
             report(force = true)
         }
 
         suspend fun failed(item: MediaItem, error: String) = mutex.withLock {
             inFlight.remove(item.id)
+            processedBytes += item.size
             done++
             failed++
             consecutiveFailures++
@@ -208,12 +225,16 @@ class BackupEngine(
                 1 -> files[0].first
                 else -> "${files[0].first} + ${files.size - 1} more"
             }
+            val inFlightSent = files.sumOf { it.second }
             onProgress(
                 Progress(
                     done, total, failed, current,
-                    fileBytes = files.sumOf { it.second },
+                    fileBytes = inFlightSent,
                     fileSize = files.sumOf { it.third },
                     bytesPerSecond = meter.update(runBytes),
+                    files = files.map { FileProgress(it.first, it.second, it.third) },
+                    bytesDone = processedBytes + inFlightSent,
+                    bytesTotal = totalBytes,
                 )
             )
         }
@@ -232,7 +253,7 @@ class BackupEngine(
         onProgress: suspend (Progress) -> Unit,
     ): Summary = coroutineScope {
         val parallel = settings.prefs.first().parallelUploads.coerceIn(1, 4)
-        val run = UploadRun(pending.size, onProgress)
+        val run = UploadRun(pending.size, pending.sumOf { it.size }, onProgress)
         val queue = Channel<MediaItem>(Channel.UNLIMITED)
         pending.forEach { queue.trySend(it) }
         queue.close()
@@ -525,7 +546,12 @@ class BackupEngine(
                 val now = System.currentTimeMillis()
                 if (now - lastReport >= PROGRESS_INTERVAL_MS || read >= item.size) {
                     lastReport = now
-                    onProgress(Progress(i, total, 0, item.name, read, item.size, phase, rate))
+                    onProgress(
+                        Progress(
+                            i, total, 0, item.name, read, item.size, phase, rate,
+                            files = listOf(FileProgress(item.name, read, item.size)),
+                        )
+                    )
                 }
             }
         }

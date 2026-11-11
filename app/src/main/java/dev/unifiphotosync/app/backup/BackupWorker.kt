@@ -81,6 +81,11 @@ class BackupWorker(context: Context, params: WorkerParameters) : CoroutineWorker
                         KEY_DONE to p.done, KEY_TOTAL to p.total, KEY_FAILED to p.failed, KEY_CURRENT to p.current,
                         KEY_FILE_BYTES to p.fileBytes, KEY_FILE_SIZE to p.fileSize,
                         KEY_PHASE to p.phase.name, KEY_RATE to p.bytesPerSecond,
+                        // One entry per file in flight (at most 4, well within WorkManager's 10 KB limit).
+                        KEY_FILE_NAMES to p.files.map { it.name.take(120) }.toTypedArray(),
+                        KEY_FILE_SENTS to p.files.map { it.sent }.toLongArray(),
+                        KEY_FILE_SIZES to p.files.map { it.size }.toLongArray(),
+                        KEY_BYTES_DONE to p.bytesDone, KEY_BYTES_TOTAL to p.bytesTotal,
                     )
                 )
                 if (p.total > 0) {
@@ -406,6 +411,11 @@ class BackupWorker(context: Context, params: WorkerParameters) : CoroutineWorker
         const val KEY_MOVE_KEPT = "move_kept"
         const val KEY_PHASE = "phase"
         const val KEY_RATE = "rate"
+        const val KEY_FILE_NAMES = "file_names"
+        const val KEY_FILE_SENTS = "file_sents"
+        const val KEY_FILE_SIZES = "file_sizes"
+        const val KEY_BYTES_DONE = "bytes_done"
+        const val KEY_BYTES_TOTAL = "bytes_total"
         const val KEY_CHECK = "check"
         const val KEY_REPAIR = "repair"
         const val KEY_CHECK_RESULT = "check_result"

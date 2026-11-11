@@ -14,8 +14,8 @@ android {
         applicationId = "dev.unifiphotosync.app"
         minSdk = 29
         targetSdk = 35
-        versionCode = 5
-        versionName = "0.1.4"
+        versionCode = 6
+        versionName = "0.1.5"
     }
 
     // Release signing key lives outside the repo; keystore.properties (git-ignored) points to it.
