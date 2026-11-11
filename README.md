@@ -5,8 +5,19 @@
 <h1 align="center">uPhotoSync</h1>
 
 <p align="center">
-  Back up your Android phone's photos and videos to a UniFi NAS (UNAS) over SMB.
+  Back up your Android phone's photos and videos to a UniFi NAS (UNAS), or any other SMB file share.
 </p>
+
+## Works with
+
+uPhotoSync was built with a UniFi NAS in mind, but it uses standard SMB (versions 2 and 3), so it should work with any SMB file share:
+
+- Synology, QNAP, TrueNAS, Unraid and other NAS devices
+- Shared folders on a Windows PC or Mac
+- Linux machines running Samba
+- Routers with a USB drive shared over SMB
+
+You need the server's address, a share name and a user with read/write access to that share. SMB1 isn't supported; it's outdated and insecure, and most devices have it turned off.
 
 ---
 
@@ -16,7 +27,7 @@ Get **`uPhotoSync.apk`** from the [Releases page](https://github.com/Into69/uPho
 
 To install it, open the APK on your phone. If Android asks, allow your browser or file manager to install apps. You need **Android 10 or newer**.
 
-> This is an early build: it hasn't been widely tested against UNAS hardware yet. Please [open an issue](https://github.com/Into69/uPhotoSync/issues) if something doesn't work.
+> This is an early build: it hasn't been widely tested yet, on UNAS or other SMB servers. Please [open an issue](https://github.com/Into69/uPhotoSync/issues) if something doesn't work, and say which NAS or server you're using.
 
 ## Features
 
@@ -76,11 +87,15 @@ If a different file with the same name is already in that folder, the new one is
 
 ## Setup
 
-### 1. On the UniFi NAS
+### 1. On the NAS or server
+
+**UniFi NAS:**
 
 1. In **UniFi Drive**, create a shared drive (or use an existing one) for your backups.
 2. Make sure a user has **read/write** access to it. That's the username and password the app will use.
 3. Note the NAS's IP address, for example `192.168.1.20`.
+
+**Any other SMB server:** share a folder over SMB, give a user read/write access to it, and note the server's IP address or hostname. The app can list the server's shares for you, so you don't need the exact share name.
 
 ### 2. In the app
 
