@@ -1,6 +1,14 @@
 package dev.unifiphotosync.app.smb
 
+import com.hierynomus.mserref.NtStatus
 import com.hierynomus.msdtyp.AccessMask
+import com.hierynomus.mssmb2.SMBApiException
+import com.rapid7.client.dcerpc.mssrvs.ServerService
+import com.rapid7.client.dcerpc.transport.SMBTransportFactories
+import java.net.ConnectException
+import java.net.NoRouteToHostException
+import java.net.SocketTimeoutException
+import java.net.UnknownHostException
 import com.hierynomus.msfscc.FileAttributes
 import com.hierynomus.mssmb2.SMB2CreateDisposition
 import com.hierynomus.mssmb2.SMB2ShareAccess
@@ -21,12 +29,15 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
 import java.util.EnumSet
 import java.util.concurrent.TimeUnit
 
 class NasNotConfiguredException : IllegalStateException("Set up the NAS connection in Settings first")
+
+data class NasShare(val name: String, val remark: String)
 
 data class NasEntry(
     val name: String,
@@ -75,12 +86,37 @@ class NasClient(private val settings: SettingsStore) {
     private val lock = Mutex()
     private var open: Open? = null
 
+    private fun auth(c: NasConfig) =
+        AuthenticationContext(c.username, c.password.toCharArray(), c.domain.ifBlank { null })
+
+    /**
+     * The file shares the NAS offers this user, via the SRVSVC RPC call (what Windows'
+     * "net view" uses). Hidden/admin shares like IPC$ are left out.
+     */
+    suspend fun listShares(config: NasConfig): List<NasShare> = withContext(Dispatchers.IO) {
+        val connection = client.connect(config.host)
+        try {
+            val session = connection.authenticate(auth(config))
+            val transport = SMBTransportFactories.SRVSVC.getTransport(session)
+            ServerService(transport).shares1
+                .filter { s ->
+                    val type = s.type
+                    (type and STYPE_MASK) == STYPE_DISKTREE && (type and STYPE_SPECIAL) == 0 && !s.netName.endsWith("$")
+                }
+                .map { NasShare(it.netName, it.remark.orEmpty()) }
+                .sortedBy { it.name.lowercase() }
+        } catch (e: LinkageError) {
+            // dcerpc reports malformed replies with java.rmi exceptions, which Android lacks.
+            throw IOException("The NAS sent a share list the app couldn't read. Type the share name instead.", e)
+        } finally {
+            runCatching { connection.close() }
+        }
+    }
+
     private fun connect(c: NasConfig): Open {
         val connection = client.connect(c.host)
         try {
-            val session = connection.authenticate(
-                AuthenticationContext(c.username, c.password.toCharArray(), c.domain.ifBlank { null })
-            )
+            val session = connection.authenticate(auth(c))
             val share = session.connectShare(c.share) as? DiskShare
                 ?: error("\"${c.share}\" is not a file share")
             return Open(c, connection, session, share)
@@ -180,6 +216,32 @@ class NasClient(private val settings: SettingsStore) {
     }
 
     companion object {
+        private const val STYPE_DISKTREE = 0
+        private const val STYPE_MASK = 0xFF
+        private const val STYPE_SPECIAL = Int.MIN_VALUE // 0x80000000: admin/hidden shares
+
+        /** Turns SMB status codes and network errors into something a person can act on. */
+        fun describe(e: Throwable): String {
+            val chain = generateSequence(e) { it.cause }.take(6).toList()
+            val status = chain.firstNotNullOfOrNull { (it as? SMBApiException)?.status }
+            return when (status) {
+                NtStatus.STATUS_BAD_NETWORK_NAME ->
+                    "The NAS has no share with that name. Tap the list button next to Share name to pick one."
+                NtStatus.STATUS_LOGON_FAILURE -> "Wrong username or password."
+                NtStatus.STATUS_ACCOUNT_DISABLED -> "That NAS user account is disabled."
+                NtStatus.STATUS_PASSWORD_EXPIRED -> "That NAS user's password has expired."
+                NtStatus.STATUS_ACCESS_DENIED -> "This user doesn't have permission for that share or folder."
+                NtStatus.STATUS_OBJECT_NAME_NOT_FOUND, NtStatus.STATUS_OBJECT_PATH_NOT_FOUND ->
+                    "That folder doesn't exist on the NAS."
+                else -> when {
+                    chain.any { it is UnknownHostException } -> "Couldn't find a NAS at that address."
+                    chain.any { it is ConnectException || it is NoRouteToHostException || it is SocketTimeoutException } ->
+                        "Couldn't reach the NAS. Check the address and that the phone is on the same network."
+                    else -> e.message ?: e.javaClass.simpleName
+                }
+            }
+        }
+
         const val PARTIAL = ".partial"
         const val BUFFER = 256 * 1024
 

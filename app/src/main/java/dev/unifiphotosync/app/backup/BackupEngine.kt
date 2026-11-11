@@ -89,7 +89,7 @@ class BackupEngine(
             } catch (e: Exception) {
                 failed++
                 consecutiveFailures++
-                lastError = "${item.name}: ${e.message ?: e.javaClass.simpleName}"
+                lastError = "${item.name}: ${NasClient.describe(e)}"
                 if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
                     aborted = true
                     break

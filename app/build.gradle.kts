@@ -14,8 +14,8 @@ android {
         applicationId = "dev.unifiphotosync.app"
         minSdk = 29
         targetSdk = 35
-        versionCode = 1
-        versionName = "0.1"
+        versionCode = 2
+        versionName = "0.1.1"
     }
 
     // Release signing key lives outside the repo; keystore.properties (git-ignored) points to it.
@@ -92,7 +92,9 @@ dependencies {
     // SMB2/3 client for the UniFi NAS share. BouncyCastle supplies MD4/RC4 for NTLM,
     // which Android's built-in crypto provider lacks.
     implementation("com.hierynomus:smbj:0.13.0")
-    implementation("org.bouncycastle:bcprov-jdk18on:1.77")
+    implementation("org.bouncycastle:bcprov-jdk18on:1.78.1")
+    // SRVSVC RPC over SMB, used only to list the NAS's shares for the share picker.
+    implementation("com.rapid7.client:dcerpc:0.12.13")
 
     testImplementation("junit:junit:4.13.2")
 }

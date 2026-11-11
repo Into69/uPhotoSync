@@ -60,11 +60,11 @@ If a different file with the same name is already in that folder, the new one is
 
 1. Open **Settings** and enter:
    - **NAS address:** IP or hostname
-   - **Share name:** the shared drive's name
    - **Username / Password:** the NAS user from step 2. The password is encrypted on the phone with the Android Keystore.
-2. Tap **Test connection**.
-3. Tap the **folder icon** next to *Destination folder* to choose (or create) where backups go, then tap **Use this folder**.
-4. Turn on **Back up new photos automatically**, or use **Back up** on the Device tab.
+2. Tap the **folder button** next to *Share name* or *Destination*. It lists the shares on the NAS. Tap one, go into (or create) the folder you want, then tap **Use this folder**. That fills in both the share and the destination.
+3. Turn on **Back up new photos automatically**, or use **Back up** on the Device tab.
+
+You can also type or paste the location, for example `\\192.168.1.20\Photos\Phone`. The app splits it into the address, share and folder.
 
 Allow the photo, video and notification permissions when asked. Allowing access to photo location keeps GPS data in the backups.
 
@@ -94,7 +94,16 @@ Without `keystore.properties`, the release APK is built unsigned.
 
 ### Built with
 
-Kotlin, Jetpack Compose (Material 3), WorkManager, DataStore, [Coil](https://coil-kt.github.io/coil/) for thumbnails, and [smbj](https://github.com/hierynomus/smbj) with BouncyCastle for SMB2/3.
+Kotlin, Jetpack Compose (Material 3), WorkManager, DataStore, [Coil](https://coil-kt.github.io/coil/) for thumbnails, [smbj](https://github.com/hierynomus/smbj) with BouncyCastle for SMB2/3, and [smbj-rpc](https://github.com/rapid7/smbj-rpc) to list the NAS's shares.
+
+## Troubleshooting
+
+| Message | Meaning |
+|---|---|
+| *The NAS has no share with that name* (`STATUS_BAD_NETWORK_NAME`, 0xC00000CC) | The share name is wrong. Use the folder button to pick it from the list. |
+| *Wrong username or password* | Check the NAS user's credentials in UniFi Drive. |
+| *This user doesn't have permission…* | Give the user read/write access to the shared drive. |
+| *Couldn't reach the NAS* | Check the address, and that the phone is on the same network as the NAS. |
 
 ## Known limitations
 

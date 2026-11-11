@@ -69,6 +69,7 @@ import coil.compose.AsyncImage
 import coil.request.ImageRequest
 import dev.unifiphotosync.app.PhotoSyncApp
 import dev.unifiphotosync.app.data.NasPath
+import dev.unifiphotosync.app.smb.NasClient
 import dev.unifiphotosync.app.smb.NasEntry
 import dev.unifiphotosync.app.smb.NasFile
 import dev.unifiphotosync.app.smb.NasNotConfiguredException
@@ -135,7 +136,7 @@ class NasViewModel(app: Application) : AndroidViewModel(app) {
                 if (path.isNotEmpty() && _state.value.entries.isEmpty() && parent != path) {
                     open(parent)
                 } else {
-                    _state.update { it.copy(loading = false, error = e.message ?: e.javaClass.simpleName) }
+                    _state.update { it.copy(loading = false, error = NasClient.describe(e)) }
                 }
             }
         }

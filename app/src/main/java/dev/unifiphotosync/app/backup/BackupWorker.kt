@@ -11,6 +11,7 @@ import androidx.work.workDataOf
 import dev.unifiphotosync.app.PhotoSyncApp
 import dev.unifiphotosync.app.R
 import dev.unifiphotosync.app.data.MediaItem
+import dev.unifiphotosync.app.smb.NasClient
 import dev.unifiphotosync.app.smb.NasNotConfiguredException
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.NonCancellable
@@ -61,7 +62,7 @@ class BackupWorker(context: Context, params: WorkerParameters) : CoroutineWorker
             throw e
         } catch (e: Exception) {
             // NAS unreachable before any upload started (e.g. while checking what's on it).
-            val error = workDataOf(KEY_ERROR to "Couldn't reach the NAS: ${e.message ?: e.javaClass.simpleName}")
+            val error = workDataOf(KEY_ERROR to NasClient.describe(e))
             return if (runAttemptCount < 3) Result.retry() else Result.failure(error).also { idsFile?.delete() }
         } finally {
             // Content-URI triggers fire once; queue the next one behind this run.

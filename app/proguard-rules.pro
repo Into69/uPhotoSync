@@ -11,6 +11,18 @@
     @net.engio.mbassy.listener.Handler <methods>;
 }
 
+# dcerpc (share listing): RPC request/response types are marshalled generically.
+-keep class com.rapid7.client.dcerpc.** { *; }
+# It throws java.rmi.(Un)MarshalException on malformed replies; Android has no java.rmi,
+# so that path surfaces as a LinkageError, which NasClient.listShares catches.
+-dontwarn java.rmi.**
+# Its Guava dependency references compile-time-only annotation and JDK classes.
+-dontwarn com.google.errorprone.annotations.**
+-dontwarn com.google.j2objc.annotations.**
+-dontwarn org.checkerframework.**
+-dontwarn javax.annotation.**
+-dontwarn sun.misc.**
+
 # BouncyCastle: smbj's BCSecurityProvider calls the lightweight API (MD4, RC4, AES-CMAC...)
 # directly, so R8 can trace what's used; everything else in bcprov is dropped.
 

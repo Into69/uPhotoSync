@@ -21,6 +21,32 @@ data class NasConfig(
     val destination: String = "",
 ) {
     val isComplete get() = host.isNotBlank() && share.isNotBlank() && username.isNotBlank()
+
+    /**
+     * Accepts what people actually paste: a host like "\\192.168.1.20" or "smb://nas/",
+     * and a share field holding a whole path ("\\nas\Photos\Phone", "Photos/Phone").
+     * The share field is reduced to just the share name; any folder part becomes the
+     * destination (unless one is already set). Wrong share names are the usual cause
+     * of STATUS_BAD_NETWORK_NAME.
+     */
+    fun normalized(): NasConfig {
+        var newHost = stripScheme(host).let(NasPath::clean).substringBefore('\\')
+        val rawShare = share.trim()
+        val isUnc = rawShare.startsWith("\\\\") || rawShare.startsWith("//") || rawShare.startsWith("smb:", true)
+        var parts = NasPath.clean(stripScheme(rawShare)).split('\\').filter { it.isNotEmpty() }
+        if (parts.size > 1 && (isUnc || parts[0].equals(newHost, ignoreCase = true))) {
+            if (newHost.isEmpty() || isUnc) newHost = parts[0]
+            parts = parts.drop(1)
+        }
+        val folder = parts.drop(1).joinToString("\\")
+        return copy(
+            host = newHost,
+            share = parts.firstOrNull().orEmpty(),
+            destination = if (destination.isBlank() && folder.isNotEmpty()) folder else NasPath.clean(destination),
+        )
+    }
+
+    private fun stripScheme(s: String) = s.trim().replace(Regex("^smb:", RegexOption.IGNORE_CASE), "")
 }
 
 enum class ViewMode { Thumbnails, Details }

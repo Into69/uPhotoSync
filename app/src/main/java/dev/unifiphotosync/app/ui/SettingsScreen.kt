@@ -19,12 +19,15 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.CreateNewFolder
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.FolderOpen
+import androidx.compose.material.icons.filled.Storage
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.ListItem
 import androidx.compose.ui.text.style.TextOverflow
 import dev.unifiphotosync.app.data.NasPath
+import dev.unifiphotosync.app.smb.NasClient
 import dev.unifiphotosync.app.smb.NasEntry
+import dev.unifiphotosync.app.smb.NasShare
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.update
 import androidx.compose.material.icons.filled.VisibilityOff
@@ -96,9 +99,15 @@ class SettingsViewModel(app: Application) : AndroidViewModel(app) {
 
     fun edit(c: NasConfig) { _form.value = c }
 
-    /** Folder browser for choosing the backup destination; null when closed. */
+    /**
+     * Browser for choosing where backups go; null when closed. Its top level lists the
+     * NAS's shares ([share] == null); inside a share it lists folders. Choosing a folder
+     * fills in both the share and the destination.
+     */
     data class Picker(
-        val path: String,
+        val share: String? = null,
+        val path: String = "",
+        val shares: List<NasShare> = emptyList(),
         val folders: List<NasEntry> = emptyList(),
         val loading: Boolean = true,
         val error: String? = null,
@@ -108,53 +117,88 @@ class SettingsViewModel(app: Application) : AndroidViewModel(app) {
     val picker = _picker.asStateFlow()
     private var pickerJob: Job? = null
 
+    /** Normalizes the form (e.g. a pasted \\nas\share\folder path) and shows the result. */
+    private fun normalizedForm(): NasConfig? = _form.value?.normalized()?.also { _form.value = it }
+
     fun openPicker() {
-        val c = _form.value ?: return
-        if (!c.isComplete) {
-            _message.value = "Fill in the address, share and username first"
+        val c = normalizedForm() ?: return
+        if (c.host.isBlank() || c.username.isBlank()) {
+            _message.value = "Fill in the NAS address, username and password first"
             return
         }
-        browse(c.destination, fallBackToParent = true)
+        if (c.share.isBlank()) showShares() else browse(c.share, c.destination, fallBack = true)
     }
 
-    fun browse(path: String, fallBackToParent: Boolean = false) {
+    /** Top level: the shares on the NAS. */
+    fun showShares() {
         val c = _form.value ?: return
+        pickerJob?.cancel()
+        _picker.value = Picker()
+        pickerJob = viewModelScope.launch {
+            runCatching { graph.nas.listShares(c) }.fold(
+                onSuccess = { shares -> _picker.update { it?.copy(shares = shares, loading = false) } },
+                onFailure = { e -> _picker.update { it?.copy(loading = false, error = NasClient.describe(e)) } },
+            )
+        }
+    }
+
+    /**
+     * Folders in [path] of [share]. With [fallBack], a saved destination that no longer
+     * exists falls back to its parent, and a share that doesn't exist to the share list.
+     */
+    fun browse(share: String, path: String, fallBack: Boolean = false) {
+        val c = _form.value?.copy(share = share) ?: return
         val clean = NasPath.clean(path)
         pickerJob?.cancel()
-        _picker.value = Picker(clean)
+        _picker.value = Picker(share = share, path = clean)
         pickerJob = viewModelScope.launch {
             runCatching { graph.nas.listFolders(c, clean) }.fold(
                 onSuccess = { folders -> _picker.update { it?.copy(folders = folders, loading = false) } },
                 onFailure = { e ->
-                    // A typed-in destination may not exist yet; show its parent instead.
-                    if (fallBackToParent && clean.isNotEmpty()) browse(NasPath.parent(clean), fallBackToParent = true)
-                    else _picker.update { it?.copy(loading = false, error = e.message ?: e.javaClass.simpleName) }
+                    when {
+                        fallBack && clean.isNotEmpty() -> browse(share, NasPath.parent(clean), fallBack = true)
+                        fallBack -> showShares()
+                        else -> _picker.update { it?.copy(loading = false, error = NasClient.describe(e)) }
+                    }
                 },
             )
         }
     }
 
+    /** Goes up one folder, or from a share's root back to the share list. */
+    fun pickerUp() {
+        val p = _picker.value ?: return
+        val share = p.share ?: return
+        if (p.path.isEmpty()) showShares() else browse(share, NasPath.parent(p.path))
+    }
+
     fun createFolder(name: String) {
-        val c = _form.value ?: return
-        val target = NasPath.join(_picker.value?.path.orEmpty(), NasPath.safeName(name))
+        val p = _picker.value ?: return
+        val share = p.share ?: return
+        val c = _form.value?.copy(share = share) ?: return
+        val target = NasPath.join(p.path, NasPath.safeName(name))
         _picker.update { it?.copy(loading = true, error = null) }
         viewModelScope.launch {
             runCatching { graph.nas.createFolder(c, target) }.fold(
-                onSuccess = { browse(target) },
-                onFailure = { e -> _picker.update { it?.copy(loading = false, error = "Couldn't create folder: ${e.message}") } },
+                onSuccess = { browse(share, target) },
+                onFailure = { e ->
+                    _picker.update { it?.copy(loading = false, error = "Couldn't create folder: ${NasClient.describe(e)}") }
+                },
             )
         }
     }
 
-    /** Uses the folder being shown as the destination and saves the connection. */
+    /** Uses the share and folder being shown as the destination and saves the connection. */
     fun choosePickerFolder() {
-        val path = _picker.value?.path ?: return
-        val c = _form.value?.copy(destination = path) ?: return
+        val p = _picker.value ?: return
+        val share = p.share ?: return
+        val c = _form.value?.copy(share = share, destination = p.path) ?: return
         _form.value = c
         _picker.value = null
         viewModelScope.launch {
+            if (!c.isComplete) return@launch
             graph.settings.saveConfig(c)
-            _message.value = "Backups will go to " + displayPath(c.share, path)
+            _message.value = "Backups will go to " + displayPath(c.share, c.destination)
         }
     }
 
@@ -164,9 +208,9 @@ class SettingsViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun save() = viewModelScope.launch {
-        val c = _form.value ?: return@launch
+        val c = normalizedForm() ?: return@launch
         if (!c.isComplete) {
-            _message.value = "Host, share and username are required"
+            _message.value = "Address, share and username are required. Use the folder button to pick a share."
             return@launch
         }
         graph.settings.saveConfig(c)
@@ -174,13 +218,13 @@ class SettingsViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun test() = viewModelScope.launch {
-        val c = _form.value ?: return@launch
+        val c = normalizedForm() ?: return@launch
         if (!c.isComplete) {
-            _message.value = "Host, share and username are required"
+            _message.value = "Address, share and username are required. Use the folder button to pick a share."
             return@launch
         }
         _testing.value = true
-        _message.value = graph.nas.test(c).fold({ it }, { "Connection failed: ${it.message ?: it.javaClass.simpleName}" })
+        _message.value = graph.nas.test(c).fold({ it }, { "Connection failed: ${NasClient.describe(it)}" })
         _testing.value = false
     }
 
@@ -224,7 +268,7 @@ fun SettingsScreen(vm: SettingsViewModel = viewModel()) {
             ) {
                 Section("UniFi NAS connection")
                 Text(
-                    "Use an SMB share on your UNAS (e.g. the share you created in UniFi Drive) and a NAS user with write access.",
+                    "Enter the NAS address and a NAS user with write access, then tap the folder button to choose the share and folder for backups.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -281,9 +325,10 @@ fun SettingsScreen(vm: SettingsViewModel = viewModel()) {
 
     picker?.let { p ->
         FolderPickerDialog(
-            share = form?.share.orEmpty(),
             picker = p,
-            onOpen = { vm.browse(it) },
+            onOpenShare = { vm.browse(it, "") },
+            onOpenFolder = { vm.browse(p.share.orEmpty(), it) },
+            onUp = vm::pickerUp,
             onCreate = vm::createFolder,
             onChoose = vm::choosePickerFolder,
             onDismiss = vm::closePicker,
@@ -307,7 +352,6 @@ fun SettingsScreen(vm: SettingsViewModel = viewModel()) {
 private fun ConnectionForm(c: NasConfig, onChange: (NasConfig) -> Unit, onBrowse: () -> Unit) {
     var showPassword by remember { mutableStateOf(false) }
     Field("NAS address (IP or hostname)", c.host, KeyboardType.Uri) { onChange(c.copy(host = it)) }
-    Field("Share name", c.share) { onChange(c.copy(share = it)) }
     Field("Username", c.username) { onChange(c.copy(username = it)) }
     OutlinedTextField(
         value = c.password,
@@ -321,6 +365,15 @@ private fun ConnectionForm(c: NasConfig, onChange: (NasConfig) -> Unit, onBrowse
                 Icon(if (showPassword) Icons.Filled.VisibilityOff else Icons.Filled.Visibility, "Show password")
             }
         },
+        modifier = Modifier.fillMaxWidth(),
+    )
+    OutlinedTextField(
+        value = c.share,
+        onValueChange = { onChange(c.copy(share = it)) },
+        label = { Text("Share name") },
+        supportingText = { Text("Tap the folder button to pick from the NAS's shares") },
+        singleLine = true,
+        trailingIcon = { IconButton(onClick = onBrowse) { Icon(Icons.Filled.FolderOpen, "Browse NAS shares") } },
         modifier = Modifier.fillMaxWidth(),
     )
     OutlinedTextField(
@@ -367,27 +420,27 @@ private fun displayPath(share: String, path: String): String =
 
 @Composable
 private fun FolderPickerDialog(
-    share: String,
     picker: SettingsViewModel.Picker,
-    onOpen: (String) -> Unit,
+    onOpenShare: (String) -> Unit,
+    onOpenFolder: (String) -> Unit,
+    onUp: () -> Unit,
     onCreate: (String) -> Unit,
     onChoose: () -> Unit,
     onDismiss: () -> Unit,
 ) {
-    var newFolder by remember { mutableStateOf<String?>(null) }
+    var newFolder by remember(picker.share, picker.path) { mutableStateOf<String?>(null) }
+    val atShares = picker.share == null
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Choose destination") },
+        title = { Text(if (atShares) "Choose a share" else "Choose destination") },
         text = {
             Column {
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    if (picker.path.isNotEmpty()) {
-                        IconButton(onClick = { onOpen(NasPath.parent(picker.path)) }) {
-                            Icon(Icons.AutoMirrored.Filled.ArrowBack, "Up")
-                        }
+                    if (!atShares) {
+                        IconButton(onClick = onUp) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Up") }
                     }
                     Text(
-                        displayPath(share, picker.path),
+                        if (atShares) "Shares on the NAS" else displayPath(picker.share.orEmpty(), picker.path),
                         style = MaterialTheme.typography.bodyMedium,
                         maxLines = 2,
                         overflow = TextOverflow.Ellipsis,
@@ -398,43 +451,64 @@ private fun FolderPickerDialog(
                     Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
                 }
                 LazyColumn(Modifier.fillMaxWidth().heightIn(max = 320.dp)) {
-                    items(picker.folders, key = { it.path }) { f ->
-                        ListItem(
-                            leadingContent = { Icon(Icons.Filled.Folder, null, tint = MaterialTheme.colorScheme.primary) },
-                            headlineContent = { Text(f.name, maxLines = 1, overflow = TextOverflow.Ellipsis) },
-                            modifier = Modifier.clickable { onOpen(f.path) },
-                        )
+                    if (atShares) {
+                        items(picker.shares, key = { it.name }) { s ->
+                            ListItem(
+                                leadingContent = { Icon(Icons.Filled.Storage, null, tint = MaterialTheme.colorScheme.primary) },
+                                headlineContent = { Text(s.name, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                                supportingContent = s.remark.takeIf { it.isNotBlank() }?.let { r -> { Text(r, maxLines = 1) } },
+                                modifier = Modifier.clickable { onOpenShare(s.name) },
+                            )
+                        }
+                    } else {
+                        items(picker.folders, key = { it.path }) { f ->
+                            ListItem(
+                                leadingContent = { Icon(Icons.Filled.Folder, null, tint = MaterialTheme.colorScheme.primary) },
+                                headlineContent = { Text(f.name, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                                modifier = Modifier.clickable { onOpenFolder(f.path) },
+                            )
+                        }
                     }
-                    if (!picker.loading && picker.folders.isEmpty() && picker.error == null) {
+                    val empty = if (atShares) picker.shares.isEmpty() else picker.folders.isEmpty()
+                    if (!picker.loading && empty && picker.error == null) {
                         item {
-                            Text("No subfolders", style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(8.dp))
+                            Text(
+                                if (atShares) "No shares available to this user" else "No subfolders",
+                                style = MaterialTheme.typography.bodySmall,
+                                modifier = Modifier.padding(8.dp),
+                            )
                         }
                     }
                 }
-                val name = newFolder
-                if (name == null) {
-                    TextButton(onClick = { newFolder = "" }, enabled = !picker.loading) {
-                        Icon(Icons.Filled.CreateNewFolder, null)
-                        Text("New folder", Modifier.padding(start = 8.dp))
-                    }
-                } else {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        OutlinedTextField(
-                            value = name,
-                            onValueChange = { newFolder = it },
-                            label = { Text("Folder name") },
-                            singleLine = true,
-                            modifier = Modifier.weight(1f),
-                        )
-                        TextButton(
-                            onClick = { onCreate(name); newFolder = null },
-                            enabled = name.isNotBlank() && !picker.loading,
-                        ) { Text("Create") }
+                if (!atShares) {
+                    val name = newFolder
+                    if (name == null) {
+                        TextButton(onClick = { newFolder = "" }, enabled = !picker.loading) {
+                            Icon(Icons.Filled.CreateNewFolder, null)
+                            Text("New folder", Modifier.padding(start = 8.dp))
+                        }
+                    } else {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            OutlinedTextField(
+                                value = name,
+                                onValueChange = { newFolder = it },
+                                label = { Text("Folder name") },
+                                singleLine = true,
+                                modifier = Modifier.weight(1f),
+                            )
+                            TextButton(
+                                onClick = { onCreate(name); newFolder = null },
+                                enabled = name.isNotBlank() && !picker.loading,
+                            ) { Text("Create") }
+                        }
                     }
                 }
             }
         },
-        confirmButton = { TextButton(onClick = onChoose, enabled = !picker.loading) { Text("Use this folder") } },
+        confirmButton = {
+            // A share has to be opened first; then its root or any folder in it can be used.
+            TextButton(onClick = onChoose, enabled = !atShares && !picker.loading) { Text("Use this folder") }
+        },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
     )
 }
