@@ -1,0 +1,9 @@
+# Line endings normalised in the repository; the Unix wrapper script must keep LF.
+* text=auto
+gradlew text eol=lf
+*.bat text eol=crlf
+*.apk binary
+*.png binary
+*.jar binary
+*.sh text eol=lf
+*.ico binary

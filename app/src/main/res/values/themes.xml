@@ -1,0 +1,3 @@
+<resources>
+    <style name="Theme.uPhotoSync" parent="android:Theme.Material.NoActionBar" />
+</resources>
