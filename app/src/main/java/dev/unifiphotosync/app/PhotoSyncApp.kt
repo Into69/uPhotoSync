@@ -8,6 +8,7 @@ import coil.ImageLoaderFactory
 import coil.decode.VideoFrameDecoder
 import dev.unifiphotosync.app.backup.BackupEngine
 import dev.unifiphotosync.app.backup.BackupScheduler
+import dev.unifiphotosync.app.data.BackupHistory
 import dev.unifiphotosync.app.data.BackupIndex
 import dev.unifiphotosync.app.data.MediaRepository
 import dev.unifiphotosync.app.data.PendingMoves
@@ -32,6 +33,7 @@ class AppGraph(app: Application) {
     val scheduler = BackupScheduler(app)
     val restorer = Restorer(app, nas, index, settings)
     val moves = PendingMoves(app)
+    val history = BackupHistory(app)
     val appScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 }
 

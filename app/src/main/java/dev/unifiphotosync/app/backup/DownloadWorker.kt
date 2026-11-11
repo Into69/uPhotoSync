@@ -10,6 +10,7 @@ import androidx.work.WorkerParameters
 import androidx.work.workDataOf
 import dev.unifiphotosync.app.PhotoSyncApp
 import dev.unifiphotosync.app.R
+import dev.unifiphotosync.app.data.HistoryEntry
 import dev.unifiphotosync.app.data.NasPath
 import dev.unifiphotosync.app.smb.NasClient
 import dev.unifiphotosync.app.smb.NasEntry
@@ -39,6 +40,7 @@ class DownloadWorker(context: Context, params: WorkerParameters) : CoroutineWork
         val entry = NasEntry(name, path, isDirectory = false, size = size, modifiedAt = inputData.getLong(KEY_MODIFIED, 0))
         runCatching { setForeground(foregroundInfo(0)) }
         val written = AtomicLong(0)
+        val startedAt = System.currentTimeMillis()
         return try {
             coroutineScope {
                 // Report progress twice a second rather than on every buffer write.
@@ -55,12 +57,17 @@ class DownloadWorker(context: Context, params: WorkerParameters) : CoroutineWork
                 graph.restorer.restore(entry) { written.set(it) }
                 reporter.cancel()
             }
+            record(HistoryEntry.Outcome.Success, "Saved $name to the phone", startedAt, written.get())
             Result.success(workDataOf(KEY_NAME to name))
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
             if (runAttemptCount < 2) Result.retry()
-            else Result.failure(workDataOf(KEY_NAME to name, KEY_ERROR to NasClient.describe(e)))
+            else {
+                val reason = NasClient.describe(e)
+                record(HistoryEntry.Outcome.Failed, "Couldn't save $name", startedAt, 0, listOf("$name: $reason"))
+                Result.failure(workDataOf(KEY_NAME to name, KEY_ERROR to reason))
+            }
         } finally {
             // If the foreground service couldn't start, the progress notification is ours to clear.
             NotificationManagerCompat.from(applicationContext).cancel(notificationId)
@@ -68,6 +75,19 @@ class DownloadWorker(context: Context, params: WorkerParameters) : CoroutineWork
     }
 
     override suspend fun getForegroundInfo(): ForegroundInfo = foregroundInfo(0)
+
+    private fun record(
+        outcome: HistoryEntry.Outcome, summary: String, startedAt: Long, bytes: Long, errors: List<String> = emptyList(),
+    ) {
+        runCatching {
+            graph.history.add(
+                HistoryEntry(
+                    id = 0, kind = "Save to phone", startedAt = startedAt, finishedAt = System.currentTimeMillis(),
+                    outcome = outcome, summary = summary, bytes = bytes, errors = errors,
+                )
+            )
+        }
+    }
 
     private fun notify(info: ForegroundInfo) {
         val nm = NotificationManagerCompat.from(applicationContext)

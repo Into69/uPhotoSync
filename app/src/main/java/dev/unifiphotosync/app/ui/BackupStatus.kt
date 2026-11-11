@@ -42,8 +42,6 @@ data class BackupStatus(
     val current: String? = null,
     val fileBytes: Long = 0,
     val fileSize: Long = 0,
-    /** Reading copies back from the NAS to check them (Move to NAS). */
-    val verifying: Boolean = false,
     /** Upload, Verify or Check (see BackupEngine.Phase). */
     val phase: String = "Upload",
     /** Current transfer rate in bytes per second. */
@@ -73,7 +71,6 @@ class BackupStatusViewModel(app: Application) : AndroidViewModel(app) {
                 current = p.getString(BackupWorker.KEY_CURRENT),
                 fileBytes = p.getLong(BackupWorker.KEY_FILE_BYTES, 0),
                 fileSize = p.getLong(BackupWorker.KEY_FILE_SIZE, 0),
-                verifying = p.getBoolean(BackupWorker.KEY_VERIFYING, false),
                 phase = p.getString(BackupWorker.KEY_PHASE) ?: "Upload",
                 bytesPerSecond = p.getLong(BackupWorker.KEY_RATE, 0),
             )

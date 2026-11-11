@@ -3,6 +3,8 @@ package dev.unifiphotosync.app.ui
 import android.app.Application
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -36,6 +38,7 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -259,7 +262,7 @@ class SettingsViewModel(app: Application) : AndroidViewModel(app) {
     }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
 fun SettingsScreen(vm: SettingsViewModel = viewModel()) {
     val form by vm.form.collectAsStateWithLifecycle()
@@ -271,6 +274,11 @@ fun SettingsScreen(vm: SettingsViewModel = viewModel()) {
     val picker by vm.picker.collectAsStateWithLifecycle()
     var confirmReset by remember { mutableStateOf(false) }
     var showCheck by remember { mutableStateOf(false) }
+    var showHistory by remember { mutableStateOf(false) }
+    if (showHistory) {
+        HistoryScreen(onBack = { showHistory = false })
+        return
+    }
     val context = LocalContext.current
     var askBackground by remember { mutableStateOf(false) }
     // Turning on automatic or scheduled backup: make sure Android will let it run.
@@ -349,6 +357,36 @@ fun SettingsScreen(vm: SettingsViewModel = viewModel()) {
                 }
 
                 HorizontalDivider(Modifier.padding(vertical = 8.dp))
+                Section("Safety & speed")
+                OptionRow(
+                    title = "Phone deletes go to the trash",
+                    detail = if (trashSupported()) "Deleted and moved files can be restored from the phone's trash for 30 days"
+                    else "Needs Android 11 or newer; on this phone, deletes are permanent",
+                    checked = prefs.phoneTrash && trashSupported(),
+                    enabled = trashSupported(),
+                ) { vm.setPrefs(prefs.copy(phoneTrash = it)) }
+                OptionRow(
+                    title = "NAS deletes go to the recycle folder",
+                    detail = "Kept in .recycle at the top of the share for 30 days, then removed",
+                    checked = prefs.nasRecycle,
+                ) { vm.setPrefs(prefs.copy(nasRecycle = it)) }
+                Text("Simultaneous uploads", style = MaterialTheme.typography.bodyMedium, modifier = Modifier.padding(top = 4.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    (1..4).forEach { n ->
+                        FilterChip(
+                            selected = prefs.parallelUploads == n,
+                            onClick = { vm.setPrefs(prefs.copy(parallelUploads = n)) },
+                            label = { Text(n.toString()) },
+                        )
+                    }
+                }
+                Text(
+                    "More is faster for lots of small photos. Use 1 if your Wi-Fi or NAS struggles.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+
+                HorizontalDivider(Modifier.padding(vertical = 8.dp))
                 Section("Background access")
                 Text(
                     "What Android needs to allow so backups and downloads keep running when the app is closed.",
@@ -360,8 +398,9 @@ fun SettingsScreen(vm: SettingsViewModel = viewModel()) {
                 HorizontalDivider(Modifier.padding(vertical = 8.dp))
                 Section("Maintenance")
                 Button(onClick = { vm.backUpNow() }) { Text("Back up everything now") }
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     OutlinedButton(onClick = { showCheck = true }) { Text("Check backups") }
+                    OutlinedButton(onClick = { showHistory = true }) { Text("History") }
                     TextButton(onClick = { confirmReset = true }) { Text("Reset history") }
                 }
             }
@@ -443,6 +482,18 @@ private fun ConnectionForm(c: NasConfig, onChange: (NasConfig) -> Unit, onBrowse
         modifier = Modifier.fillMaxWidth(),
     )
     Field("Domain (usually blank)", c.domain) { onChange(c.copy(domain = it)) }
+    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+        Column(Modifier.weight(1f)) {
+            Text("Encrypt connection (SMB3)")
+            Text(
+                "Others on your network can't read your photos in transit. Test connection shows whether " +
+                    "your NAS supports it.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        Switch(checked = c.encrypt, onCheckedChange = { onChange(c.copy(encrypt = it)) })
+    }
 }
 
 @Composable
@@ -567,4 +618,21 @@ private fun FolderPickerDialog(
         },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
     )
+}
+
+@Composable
+private fun OptionRow(
+    title: String,
+    detail: String,
+    checked: Boolean,
+    enabled: Boolean = true,
+    onChange: (Boolean) -> Unit,
+) {
+    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+        Column(Modifier.weight(1f)) {
+            Text(title)
+            Text(detail, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+        Switch(checked = checked, onCheckedChange = onChange, enabled = enabled)
+    }
 }

@@ -11,6 +11,8 @@ import androidx.work.WorkerParameters
 import androidx.work.workDataOf
 import dev.unifiphotosync.app.PhotoSyncApp
 import dev.unifiphotosync.app.R
+import dev.unifiphotosync.app.data.HistoryEntry
+import dev.unifiphotosync.app.data.HistoryEntry.Outcome
 import dev.unifiphotosync.app.data.MediaItem
 import dev.unifiphotosync.app.data.WifiNetwork
 import dev.unifiphotosync.app.smb.NasClient
@@ -40,6 +42,7 @@ class BackupWorker(context: Context, params: WorkerParameters) : CoroutineWorker
         try {
             if (graph.settings.config.first() == null) {
                 if (scheduled) postReport("Scheduled backup failed", "The NAS isn't set up. Open Settings to connect it.")
+                record(Outcome.Failed, "The NAS isn't set up", startedAt)
                 return Result.failure(stamped(KEY_ERROR to "NAS not set up"))
             }
             if (scheduled) {
@@ -61,6 +64,7 @@ class BackupWorker(context: Context, params: WorkerParameters) : CoroutineWorker
                         "on \"$ssid\", not an allowed Wi-Fi network"
                     }
                     if (scheduled) postReport("Scheduled backup skipped", why.replaceFirstChar { it.uppercase() })
+                    record(Outcome.Skipped, "Skipped: $why", startedAt)
                     return Result.success(stamped(KEY_SKIPPED to "Automatic backup skipped: $why"))
                 }
             }
@@ -75,7 +79,7 @@ class BackupWorker(context: Context, params: WorkerParameters) : CoroutineWorker
                 setProgress(
                     workDataOf(
                         KEY_DONE to p.done, KEY_TOTAL to p.total, KEY_FAILED to p.failed, KEY_CURRENT to p.current,
-                        KEY_FILE_BYTES to p.fileBytes, KEY_FILE_SIZE to p.fileSize, KEY_VERIFYING to p.verifying,
+                        KEY_FILE_BYTES to p.fileBytes, KEY_FILE_SIZE to p.fileSize,
                         KEY_PHASE to p.phase.name, KEY_RATE to p.bytesPerSecond,
                     )
                 )
@@ -100,6 +104,18 @@ class BackupWorker(context: Context, params: WorkerParameters) : CoroutineWorker
                 val (title, text) = describeCheck(report, mode == CHECK_FULL)
                 // Check reports open Settings, where Check backups lives.
                 postReport(title, text, Tab.Settings)
+                record(
+                    outcome = when {
+                        report.aborted || report.repairFailed > 0 -> Outcome.Partial
+                        report.missing + report.different + report.unreadable > 0 && report.repaired == 0 -> Outcome.Partial
+                        else -> Outcome.Success
+                    },
+                    summary = text,
+                    startedAt = startedAt,
+                    uploaded = report.repaired,
+                    failed = report.repairFailed,
+                    errors = report.errors,
+                )
                 return Result.success(stamped(KEY_CHECK_RESULT to "$title: $text"))
             }
 
@@ -112,7 +128,7 @@ class BackupWorker(context: Context, params: WorkerParameters) : CoroutineWorker
             var moveKept = 0
             if (move && !summary.aborted) {
                 val verified = graph.engine.verifyCopies(items, onProgress)
-                graph.moves.add(verified)
+                graph.moves.add(items.filter { it.id in verified }.associate { it.id to it.modifiedAt })
                 moveReady = verified.size
                 moveKept = items.size - verified.size
                 reportMove(moveReady, moveKept)
@@ -133,14 +149,34 @@ class BackupWorker(context: Context, params: WorkerParameters) : CoroutineWorker
                     "${summary.lastError ?: "The NAS stopped responding"}. Nothing was deleted from the phone.",
                 )
             }
+            val quietAutomatic = automatic && !scheduled && summary.uploaded == 0 && summary.failed == 0
+            if (!quietAutomatic) {
+                record(
+                    outcome = when {
+                        summary.aborted -> Outcome.Failed
+                        summary.failed > 0 || moveKept > 0 -> Outcome.Partial
+                        else -> Outcome.Success
+                    },
+                    summary = buildList {
+                        add("${summary.uploaded} uploaded")
+                        if (summary.alreadyThere > 0) add("${summary.alreadyThere} already on the NAS")
+                        if (summary.failed > 0) add("${summary.failed} failed")
+                        if (move) add("$moveReady verified for deleting from the phone")
+                        if (moveKept > 0) add("$moveKept kept on the phone")
+                        if (summary.aborted) add(if (willRetry) "stopped, will retry" else "stopped")
+                    }.joinToString(", "),
+                    startedAt = startedAt,
+                    summary.uploaded, summary.alreadyThere, summary.failed, summary.bytesUploaded, summary.errors,
+                )
+            }
             return when {
                 willRetry -> Result.retry().also { retrying = true }
-                summary.aborted -> Result.failure(out).also { idsFile?.delete() }
-                else -> Result.success(out).also { idsFile?.delete() }
+                summary.aborted -> Result.failure(out)
+                else -> Result.success(out)
             }
         } catch (e: NasNotConfiguredException) {
-            idsFile?.delete()
             if (scheduled || move) postReport("$runLabel failed", e.message.orEmpty())
+            record(Outcome.Failed, e.message.orEmpty(), startedAt)
             return Result.failure(stamped(KEY_ERROR to e.message))
         } catch (e: CancellationException) {
             throw e
@@ -150,10 +186,12 @@ class BackupWorker(context: Context, params: WorkerParameters) : CoroutineWorker
             if (runAttemptCount < 3) {
                 retrying = true
                 if (scheduled || move) postReport("$runLabel will retry soon", reason)
+                record(Outcome.Failed, "$reason (will retry)", startedAt)
                 return Result.retry()
             }
             if (scheduled || move) postReport("$runLabel failed", reason + if (move) ". Nothing was deleted from the phone." else "")
-            return Result.failure(stamped(KEY_ERROR to reason)).also { idsFile?.delete() }
+            record(Outcome.Failed, reason, startedAt)
+            return Result.failure(stamped(KEY_ERROR to reason))
         } finally {
             withContext(NonCancellable) {
                 // A progress notification we posted ourselves (no foreground service) isn't
@@ -163,6 +201,9 @@ class BackupWorker(context: Context, params: WorkerParameters) : CoroutineWorker
                 if (fromTrigger) graph.scheduler.queueNextTrigger(graph.settings.prefs.first())
                 // Pin the next daily run to the chosen time (a retry keeps its own backoff timing).
                 if (scheduled && !retrying) graph.scheduler.applySchedule(graph.settings.prefs.first())
+                // The selection list is only needed if this run will be retried. Finished,
+                // failed or cancelled, it's done with.
+                if (!retrying) idsFile?.delete()
             }
         }
     }
@@ -181,6 +222,38 @@ class BackupWorker(context: Context, params: WorkerParameters) : CoroutineWorker
                 if (albums.isEmpty()) all else all.filter { it.bucketId in albums }
             }
         }
+
+    /** What kind of run this is, for the history. */
+    private val kindLabel: String
+        get() = when {
+            inputData.getString(KEY_CHECK) == CHECK_FULL -> "Full check"
+            inputData.getString(KEY_CHECK) == CHECK_QUICK -> "Quick check"
+            move -> "Move to NAS"
+            scheduled -> "Scheduled backup"
+            inputData.getString(KEY_SCOPE) == null -> "Automatic backup"
+            else -> "Backup"
+        }
+
+    private fun record(
+        outcome: Outcome,
+        summary: String,
+        startedAt: Long,
+        uploaded: Int = 0,
+        alreadyThere: Int = 0,
+        failed: Int = 0,
+        bytes: Long = 0,
+        errors: List<String> = emptyList(),
+    ) {
+        runCatching {
+            graph.history.add(
+                HistoryEntry(
+                    id = 0, kind = kindLabel, startedAt = startedAt, finishedAt = System.currentTimeMillis(),
+                    outcome = outcome, summary = summary, uploaded = uploaded, alreadyThere = alreadyThere,
+                    failed = failed, bytes = bytes, errors = errors,
+                )
+            )
+        }
+    }
 
     /** Output data with the finish time, so the UI can show the most recent result. */
     private fun stamped(vararg pairs: Pair<String, Any?>) =
@@ -245,14 +318,18 @@ class BackupWorker(context: Context, params: WorkerParameters) : CoroutineWorker
         val problems = r.missing + r.different + r.unreadable
         if (r.checked == 0) return "$kind finished" to "Nothing is marked as backed up yet."
         if (problems == 0) {
+            // Count only what was actually confirmed; files skipped mid-check weren't compared.
+            val all = if (r.ok == r.checked) "All " else ""
+            val skippedNote = if (r.skipped > 0) " ${r.skipped} skipped (no longer on the phone)." else ""
             return "$kind: all good" to
-                "All ${r.checked} backed-up ${if (r.checked == 1) "file is" else "files are"} on the NAS" +
-                if (full) " and identical to the phone." else "."
+                "$all${r.ok} backed-up ${if (r.ok == 1) "file is" else "files are"} on the NAS" +
+                (if (full) " and identical to the phone." else ".") + skippedNote
         }
         val found = buildList {
             if (r.missing > 0) add("${r.missing} missing")
             if (r.different > 0) add("${r.different} different")
             if (r.unreadable > 0) add("${r.unreadable} couldn't be read")
+            if (r.skipped > 0) add("${r.skipped} skipped (no longer on the phone)")
         }.joinToString(", ")
         val fix = when {
             r.repaired + r.repairFailed == 0 -> " Run a backup to upload them again."
@@ -325,7 +402,6 @@ class BackupWorker(context: Context, params: WorkerParameters) : CoroutineWorker
         const val KEY_SKIPPED = "skipped"
         const val KEY_FINISHED_AT = "finished_at"
         const val KEY_MOVE = "move"
-        const val KEY_VERIFYING = "verifying"
         const val KEY_MOVE_READY = "move_ready"
         const val KEY_MOVE_KEPT = "move_kept"
         const val KEY_PHASE = "phase"

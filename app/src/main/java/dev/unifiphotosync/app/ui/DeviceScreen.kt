@@ -33,12 +33,18 @@ import android.content.IntentSender
 import android.os.Build
 import androidx.activity.result.IntentSenderRequest
 import androidx.compose.material.icons.automirrored.filled.DriveFileMove
+import androidx.compose.material.icons.automirrored.filled.OpenInNew
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.AlertDialog
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.grid.GridItemSpan
+import java.time.Instant
+import java.time.YearMonth
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
 import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.outlined.CloudOff
@@ -101,6 +107,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
@@ -187,14 +194,45 @@ class DeviceViewModel(app: Application) : AndroidViewModel(app) {
 
     private var pendingDelete: List<MediaItem> = emptyList()
     private val deletedIds = ArrayList<Long>()
+    private var deleteFromSelection = false
+    private var deleteToTrash = false
+
+    /** Phone deletes go to Android's trash (Android 11+, if turned on in Settings). */
+    val deletesGoToTrash = graph.settings.prefs.map { it.phoneTrash && trashSupported() }
+        .stateIn(viewModelScope, SharingStarted.Eagerly, trashSupported())
+
+    /** True while a delete (and its system confirmation) is in progress; only one at a time. */
+    var deleting = false
+        private set
 
     /**
      * "Move to NAS" items whose NAS copy has been verified, still on the phone and waiting
      * for the user to confirm deleting them.
      */
-    val moveReady = combine(all, graph.moves.ids) { all, ids ->
-        all.orEmpty().filter { it.id in ids }
+    val moveReady = combine(all, graph.moves.verified, graph.index.sizes) { all, verified, sizes ->
+        all.orEmpty().filter { stillSafeToDelete(it, verified, sizes) }
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+
+    /**
+     * A moved file may only be deleted from the phone while its verified NAS copy is still
+     * recorded at the same size (not deleted on the NAS, not found damaged) and the phone
+     * file is unchanged since it was verified.
+     */
+    private fun stillSafeToDelete(item: MediaItem, verified: Map<Long, Long>, sizes: Map<Long, Long>) =
+        verified[item.id].let { at -> at != null && at == item.modifiedAt } && sizes[item.id] == item.size
+
+    init {
+        // Drop moves that are no longer safe (or whose file is gone), so they aren't offered later.
+        viewModelScope.launch {
+            combine(all, graph.moves.verified, graph.index.sizes) { all, verified, sizes ->
+                if (all == null) emptyList()
+                else {
+                    val byId = all.associateBy { it.id }
+                    verified.keys.filter { id -> byId[id]?.let { !stillSafeToDelete(it, verified, sizes) } ?: true }
+                }
+            }.collect { stale -> graph.moves.remove(stale) }
+        }
+    }
 
     /** Starts a move: upload, verify byte for byte, then delete from the phone. Manual only. */
     suspend fun moveSelected(): Boolean {
@@ -212,15 +250,24 @@ class DeviceViewModel(app: Application) : AndroidViewModel(app) {
      * Android's confirmation prompt to show, or null if everything was deleted without one.
      */
     suspend fun startDelete(items: List<MediaItem>? = null): IntentSender? {
+        // A second delete would overwrite this one's batch and misreport what was deleted.
+        if (deleting) return null
         val ids = selected.value
+        deleteFromSelection = items == null
         pendingDelete = items ?: all.value.orEmpty().filter { it.id in ids }
         deletedIds.clear()
         if (pendingDelete.isEmpty()) return null
+        deleting = true
         val resolver = getApplication<Application>().contentResolver
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            // One system dialog for the whole batch; the system deletes them if the user agrees.
-            MediaStore.createDeleteRequest(resolver, pendingDelete.map { it.uri }).intentSender
+            // One system dialog for the whole batch; the system deletes (or trashes) them if the
+            // user agrees. Trashed files can be restored from the gallery for 30 days.
+            deleteToTrash = graph.settings.prefs.first().phoneTrash
+            val uris = pendingDelete.map { it.uri }
+            if (deleteToTrash) MediaStore.createTrashRequest(resolver, uris, true).intentSender
+            else MediaStore.createDeleteRequest(resolver, uris).intentSender
         } else {
+            deleteToTrash = false
             continueDelete()
         }
     }
@@ -238,6 +285,8 @@ class DeviceViewModel(app: Application) : AndroidViewModel(app) {
                 deletedIds += item.id
             } catch (e: RecoverableSecurityException) {
                 return@withContext e.userAction.actionIntent.intentSender
+            } catch (e: Exception) {
+                // Already gone, or the provider refused outright: skip it rather than crash.
             }
             pendingDelete = pendingDelete.drop(1)
         }
@@ -256,9 +305,16 @@ class DeviceViewModel(app: Application) : AndroidViewModel(app) {
         graph.moves.remove(deletedIds)
         pendingDelete = emptyList()
         deletedIds.clear()
-        clearSelection()
+        // Only clear the selection if that's what was being deleted (not a finished move).
+        if (deleteFromSelection) clearSelection()
+        deleting = false
         reload()
-        return if (n == 0) "Nothing deleted" else "Deleted $n ${if (n == 1) "item" else "items"} from this phone"
+        val items = if (n == 1) "item" else "items"
+        return when {
+            n == 0 -> "Nothing deleted"
+            deleteToTrash -> "Moved $n $items to the trash (restorable for 30 days)"
+            else -> "Deleted $n $items from this phone"
+        }
     }
 
     /** Returns false if the NAS isn't set up yet. */
@@ -308,10 +364,20 @@ fun DeviceScreen(onOpenSettings: () -> Unit, vm: DeviceViewModel = viewModel()) 
 
     // Deleting photos the app didn't create needs the user's OK in a system dialog.
     var confirmUnbacked by remember { mutableStateOf(0) }
+    // True while Android's delete confirmation is showing.
+    var deleteOpen by remember { mutableStateOf(false) }
+    // Position in the list of the photo open in the full-screen viewer.
+    var viewerIndex by remember { mutableStateOf<Int?>(null) }
     lateinit var deleteLauncher: androidx.activity.result.ActivityResultLauncher<IntentSenderRequest>
     fun showOrFinish(sender: IntentSender?, confirmedBatch: Boolean = false) {
-        if (sender != null) deleteLauncher.launch(IntentSenderRequest.Builder(sender).build())
-        else scope.launch { snackbar.showSnackbar(vm.finishDelete(confirmedBatch)) }
+        if (sender != null) {
+            deleteOpen = true
+            deleteLauncher.launch(IntentSenderRequest.Builder(sender).build())
+        } else {
+            val message = if (vm.deleting) vm.finishDelete(confirmedBatch) else null
+            deleteOpen = false
+            if (message != null) scope.launch { snackbar.showSnackbar(message) }
+        }
     }
     deleteLauncher = rememberLauncherForActivityResult(ActivityResultContracts.StartIntentSenderForResult()) { result ->
         val ok = result.resultCode == Activity.RESULT_OK
@@ -322,13 +388,18 @@ fun DeviceScreen(onOpenSettings: () -> Unit, vm: DeviceViewModel = viewModel()) 
             else -> showOrFinish(null)
         }
     }
-    fun startDelete(items: List<MediaItem>? = null) = scope.launch { showOrFinish(vm.startDelete(items)) }
+    fun startDelete(items: List<MediaItem>? = null) {
+        // One delete at a time; a second would be mistaken for the first one finishing.
+        if (vm.deleting) return
+        scope.launch { showOrFinish(vm.startDelete(items)) }
+    }
 
     // "Move to NAS": once copies are verified, ask Android to delete them from the phone.
     val moveReady by vm.moveReady.collectAsStateWithLifecycle()
     var confirmMove by remember { mutableStateOf(false) }
     var lastPrompted by remember { mutableStateOf(emptySet<Long>()) }
-    LaunchedEffect(moveReady) {
+    LaunchedEffect(moveReady, deleteOpen) {
+        if (deleteOpen) return@LaunchedEffect
         // Prompt once per newly verified batch while the app is open; the banner stays as a fallback.
         val ids = moveReady.mapTo(HashSet()) { it.id }
         if (ids.isNotEmpty() && !lastPrompted.containsAll(ids)) {
@@ -367,6 +438,7 @@ fun DeviceScreen(onOpenSettings: () -> Unit, vm: DeviceViewModel = viewModel()) 
     if (confirmUnbacked > 0) {
         UnbackedDeleteDialog(
             count = confirmUnbacked,
+            toTrash = vm.deletesGoToTrash.value,
             onConfirm = { confirmUnbacked = 0; startDelete() },
             onDismiss = { confirmUnbacked = 0 },
         )
@@ -458,12 +530,7 @@ fun DeviceScreen(onOpenSettings: () -> Unit, vm: DeviceViewModel = viewModel()) 
                 else -> {
                     val onClick: (MediaItem) -> Unit = { item ->
                         if (selecting) vm.toggle(item.id)
-                        else runCatching {
-                            context.startActivity(
-                                Intent(Intent.ACTION_VIEW).setDataAndType(item.uri, item.mimeType)
-                                    .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                            )
-                        }
+                        else viewerIndex = state.items.indexOfFirst { it.id == item.id }.takeIf { it >= 0 }
                     }
                     val onLongClick: (MediaItem) -> Unit = { vm.toggle(it.id) }
                     when (viewMode) {
@@ -474,10 +541,54 @@ fun DeviceScreen(onOpenSettings: () -> Unit, vm: DeviceViewModel = viewModel()) 
             }
         }
     }
+
+    viewerIndex?.let { start ->
+        val viewerItems = remember(state.items, state.backedUp) {
+            state.items.map {
+                ViewerItem(
+                    key = it.id,
+                    model = it.uri,
+                    title = it.name,
+                    subtitle = "${formatDate(it.takenAt)} · ${formatSize(it.size)} · " +
+                        if (state.isBackedUp(it)) "On the NAS" else "Not backed up yet",
+                    isVideo = it.isVideo,
+                )
+            }
+        }
+        // [chooser]: let the user pick the app every time ("Open with"); otherwise use the default.
+        fun openExternally(v: ViewerItem, chooser: Boolean) {
+            val item = state.items.firstOrNull { it.id == v.key } ?: return
+            val view = Intent(Intent.ACTION_VIEW).setDataAndType(item.uri, item.mimeType)
+                .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            runCatching { context.startActivity(if (chooser) Intent.createChooser(view, "Open with") else view) }
+        }
+        MediaViewer(
+            items = viewerItems,
+            startIndex = start,
+            onDismiss = { viewerIndex = null },
+            // Videos play in the phone's default video app.
+            onPlay = { openExternally(it, chooser = false) },
+            topActions = { current ->
+                // Small and slightly dimmed so it doesn't compete with the photo, but a full-size
+                // touch target; it hides with the rest of the controls on a tap.
+                IconButton(onClick = { openExternally(current, chooser = true) }) {
+                    Icon(
+                        Icons.AutoMirrored.Filled.OpenInNew,
+                        contentDescription = "Open with another app",
+                        tint = Color.White.copy(alpha = 0.75f),
+                        modifier = Modifier.size(20.dp),
+                    )
+                }
+            },
+        )
+    }
 }
 
+/** Android's trash for media (createTrashRequest) arrived in Android 11. */
+fun trashSupported() = Build.VERSION.SDK_INT >= Build.VERSION_CODES.R
+
 @Composable
-private fun UnbackedDeleteDialog(count: Int, onConfirm: () -> Unit, onDismiss: () -> Unit) {
+private fun UnbackedDeleteDialog(count: Int, toTrash: Boolean, onConfirm: () -> Unit, onDismiss: () -> Unit) {
     AlertDialog(
         onDismissRequest = onDismiss,
         icon = { Icon(Icons.Filled.Warning, null, tint = MaterialTheme.colorScheme.error) },
@@ -485,8 +596,9 @@ private fun UnbackedDeleteDialog(count: Int, onConfirm: () -> Unit, onDismiss: (
         text = {
             Text(
                 "$count of the selected ${if (count == 1) "item isn't" else "items aren't"} on the NAS yet. " +
-                    "Deleting from the phone will lose ${if (count == 1) "it" else "them"} for good. Back up first, " +
-                    "or delete anyway?"
+                    (if (toTrash) "They'll only be in the phone's trash, for 30 days. "
+                    else "Deleting from the phone will lose ${if (count == 1) "it" else "them"} for good. ") +
+                    "Back up first, or delete anyway?"
             )
         },
         confirmButton = {
@@ -517,6 +629,7 @@ private fun AlbumPicker(state: DeviceUiState, onSelect: (String?) -> Unit) {
 @Composable
 private fun MediaGrid(state: DeviceUiState, onClick: (MediaItem) -> Unit, onLongClick: (MediaItem) -> Unit) {
     val context = LocalContext.current
+    val groups = remember(state.items) { monthGroups(state.items) }
     LazyVerticalGrid(
         columns = GridCells.Adaptive(110.dp),
         contentPadding = PaddingValues(2.dp, 2.dp, 2.dp, 88.dp),
@@ -524,7 +637,9 @@ private fun MediaGrid(state: DeviceUiState, onClick: (MediaItem) -> Unit, onLong
         verticalArrangement = Arrangement.spacedBy(2.dp),
         modifier = Modifier.fillMaxSize(),
     ) {
-        items(state.items, key = { it.id }) { item ->
+        groups.forEach { (month, list) ->
+        item(key = "month-$month", span = { GridItemSpan(maxLineSpan) }) { MonthHeader(month, list.size) }
+        items(list, key = { it.id }) { item ->
             val selected = item.id in state.selected
             Box(
                 Modifier
@@ -560,6 +675,7 @@ private fun MediaGrid(state: DeviceUiState, onClick: (MediaItem) -> Unit, onLong
                 }
             }
         }
+        }
     }
 }
 
@@ -572,8 +688,11 @@ private fun MediaList(
     onLongClick: (MediaItem) -> Unit,
 ) {
     val context = LocalContext.current
+    val groups = remember(state.items) { monthGroups(state.items) }
     LazyColumn(contentPadding = PaddingValues(bottom = 88.dp), modifier = Modifier.fillMaxSize()) {
-        items(state.items, key = { it.id }) { item ->
+        groups.forEach { (month, list) ->
+        stickyHeader(key = "month-$month") { MonthHeader(month, list.size) }
+        items(list, key = { it.id }) { item ->
             val selected = item.id in state.selected
             val backedUp = state.isBackedUp(item)
             ListItem(
@@ -616,6 +735,25 @@ private fun MediaList(
                 },
             )
         }
+        }
+    }
+}
+
+/** Items grouped by the month they were taken, newest first (the list is already sorted). */
+private fun monthGroups(items: List<MediaItem>): List<Pair<YearMonth, List<MediaItem>>> =
+    items.groupBy { YearMonth.from(Instant.ofEpochMilli(it.takenAt).atZone(ZoneId.systemDefault())) }.toList()
+
+private val monthFormat: DateTimeFormatter = DateTimeFormatter.ofPattern("LLLL yyyy")
+
+@Composable
+private fun MonthHeader(month: YearMonth, count: Int) {
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surface)
+            .padding(horizontal = 12.dp, vertical = 8.dp),
+    ) {
+        Text(month.format(monthFormat), style = MaterialTheme.typography.titleSmall, modifier = Modifier.weight(1f))
+        Text("$count", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
     }
 }
 

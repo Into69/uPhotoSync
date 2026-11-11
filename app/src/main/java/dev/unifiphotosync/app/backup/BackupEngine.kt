@@ -12,6 +12,11 @@ import dev.unifiphotosync.app.smb.NasClient
 import dev.unifiphotosync.app.smb.NasClient.Companion.RemoteFile
 import dev.unifiphotosync.app.smb.NasNotConfiguredException
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.joinAll
+import kotlinx.coroutines.launch
+import java.util.concurrent.ConcurrentHashMap
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.first
@@ -19,7 +24,6 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import java.io.FileNotFoundException
 import java.io.InputStream
-import java.security.MessageDigest
 import kotlin.math.abs
 
 /**
@@ -51,9 +55,7 @@ class BackupEngine(
         val phase: Phase = Phase.Upload,
         /** Current transfer rate, bytes per second (0 when nothing is moving). */
         val bytesPerSecond: Long = 0,
-    ) {
-        val verifying get() = phase == Phase.Verify
-    }
+    )
 
     data class Summary(
         val uploaded: Int,
@@ -62,6 +64,10 @@ class BackupEngine(
         /** True if the run stopped early because the NAS kept failing. */
         val aborted: Boolean,
         val lastError: String?,
+        /** Bytes sent to the NAS in this run. */
+        val bytesUploaded: Long = 0,
+        /** "file: reason" for each failure, for the history (capped). */
+        val errors: List<String> = emptyList(),
     )
 
     /** Result of "Check backups". */
@@ -74,31 +80,41 @@ class BackupEngine(
         val different: Int,
         /** Couldn't be read to compare (full check only). */
         val unreadable: Int,
+        /** Not compared, e.g. deleted from the phone during the check (full check only). */
+        val skipped: Int,
         /** Re-uploaded to fix the above, if repair was on. */
         val repaired: Int,
         val repairFailed: Int,
         val aborted: Boolean,
         val lastError: String?,
+        val errors: List<String> = emptyList(),
     )
 
     private val lock = Mutex()
 
-    /** Per-run memory of NAS folders, so each one is listed (and created) at most once. */
+    /**
+     * Per-run memory of NAS folders, so each one is listed (and created) at most once.
+     * Shared by parallel uploads, hence the locking and concurrent maps.
+     */
     private class FolderCache {
         private val listings = HashMap<String, MutableMap<String, RemoteFile>>()
         private val ensured = HashSet<String>()
 
+        @Synchronized
         fun files(share: DiskShare, dir: String): MutableMap<String, RemoteFile> =
             listings.getOrPut(dir.lowercase()) {
-                NasClient.listFiles(share, dir)?.toMutableMap()?.also { ensured += dir.lowercase() } ?: HashMap()
+                NasClient.listFiles(share, dir)?.let { ConcurrentHashMap(it) }?.also { ensured += dir.lowercase() }
+                    ?: ConcurrentHashMap()
             }
 
+        @Synchronized
         fun ensureDir(share: DiskShare, dir: String) {
             if (ensured.add(dir.lowercase())) NasClient.mkdirs(share, dir)
         }
 
+        @Synchronized
         fun put(dir: String, file: RemoteFile) {
-            listings.getOrPut(dir.lowercase()) { HashMap() }[file.name.lowercase()] = file
+            listings.getOrPut(dir.lowercase()) { ConcurrentHashMap() }[file.name.lowercase()] = file
         }
     }
 
@@ -107,14 +123,106 @@ class BackupEngine(
     suspend fun run(items: List<MediaItem>, onProgress: suspend (Progress) -> Unit): Summary = lock.withLock {
         val config = settings.config.first() ?: throw NasNotConfiguredException()
         onProgress(Progress(0, 0, 0, null))
+        // Housekeeping: deleted NAS files older than 30 days leave the recycle folder.
+        runCatching { nas.emptyOldRecycle() }
         val cache = FolderCache()
         forgetMissing(config, items, cache)
-        uploadAll(config, items.filterNot(index::isBackedUp), cache, overwrite = emptyMap(), onProgress = onProgress)
+        uploadAll(config, items.filterNot(index::isBackedUp), cache, overwrite = index.damaged(), onProgress = onProgress)
     }
 
     /**
-     * Uploads [pending]. [overwrite] maps media ids to a NAS path to replace (a damaged copy
-     * found by a full check) instead of choosing a name.
+     * Counters and progress for one upload run, shared by the parallel upload workers.
+     * Progress shows every file in flight combined, so the "current file" bar still means
+     * "how far along the files being sent right now are".
+     */
+    private class UploadRun(private val total: Int, private val onProgress: suspend (Progress) -> Unit) {
+        private val mutex = Mutex()
+        private val inFlight = LinkedHashMap<Long, Triple<String, Long, Long>>() // id -> name, sent, size
+        private val meter = RateMeter()
+        private var lastReport = 0L
+        var runBytes = 0L
+            private set
+        var done = 0
+        var uploaded = 0
+        var alreadyThere = 0
+        var failed = 0
+        private var consecutiveFailures = 0
+        var lastError: String? = null
+        val errors = ArrayList<String>()
+
+        @Volatile
+        var aborted = false
+
+        suspend fun start(item: MediaItem) = mutex.withLock {
+            inFlight[item.id] = Triple(item.name, 0L, item.size)
+            report(force = true)
+        }
+
+        /** [sent] bytes of [item] so far; [previous] is what was last reported for it. */
+        suspend fun bytes(item: MediaItem, sent: Long, previous: Long) = mutex.withLock {
+            runBytes += sent - previous
+            inFlight[item.id] = Triple(item.name, sent, item.size)
+            report(force = false)
+        }
+
+        /** A retry restarts the file, so don't count the failed attempt's bytes twice. */
+        suspend fun restart(item: MediaItem, previous: Long) = mutex.withLock {
+            runBytes -= previous
+            inFlight[item.id] = Triple(item.name, 0L, item.size)
+        }
+
+        suspend fun finished(item: MediaItem, sent: Boolean) = mutex.withLock {
+            inFlight.remove(item.id)
+            done++
+            if (sent) uploaded++ else alreadyThere++
+            consecutiveFailures = 0
+            report(force = true)
+        }
+
+        suspend fun skipped(item: MediaItem) = mutex.withLock {
+            inFlight.remove(item.id)
+            done++
+            report(force = true)
+        }
+
+        suspend fun failed(item: MediaItem, error: String) = mutex.withLock {
+            inFlight.remove(item.id)
+            done++
+            failed++
+            consecutiveFailures++
+            lastError = error
+            if (errors.size < MAX_ERRORS_KEPT) errors += error
+            // Several in a row means the NAS itself is in trouble: stop and retry later.
+            if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) aborted = true
+            report(force = true)
+        }
+
+        private suspend fun report(force: Boolean) {
+            val now = System.currentTimeMillis()
+            // Progress goes through WorkManager's database, so report a few times a second at most.
+            if (!force && now - lastReport < PROGRESS_INTERVAL_MS) return
+            lastReport = now
+            val files = inFlight.values.toList()
+            val current = when (files.size) {
+                0 -> null
+                1 -> files[0].first
+                else -> "${files[0].first} + ${files.size - 1} more"
+            }
+            onProgress(
+                Progress(
+                    done, total, failed, current,
+                    fileBytes = files.sumOf { it.second },
+                    fileSize = files.sumOf { it.third },
+                    bytesPerSecond = meter.update(runBytes),
+                )
+            )
+        }
+    }
+
+    /**
+     * Uploads [pending], several at a time (Settings > Simultaneous uploads). [overwrite]
+     * maps media ids to a NAS path to replace (a damaged copy found by a full check) instead
+     * of choosing a name.
      */
     private suspend fun uploadAll(
         config: NasConfig,
@@ -122,61 +230,55 @@ class BackupEngine(
         cache: FolderCache,
         overwrite: Map<Long, String>,
         onProgress: suspend (Progress) -> Unit,
-    ): Summary {
-        var uploaded = 0
-        var alreadyThere = 0
-        var failed = 0
-        var consecutiveFailures = 0
-        var lastError: String? = null
-        var aborted = false
-        val meter = RateMeter()
-        var runBytes = 0L // bytes sent across the whole run, for the rate
+    ): Summary = coroutineScope {
+        val parallel = settings.prefs.first().parallelUploads.coerceIn(1, 4)
+        val run = UploadRun(pending.size, onProgress)
+        val queue = Channel<MediaItem>(Channel.UNLIMITED)
+        pending.forEach { queue.trySend(it) }
+        queue.close()
 
-        for ((i, item) in pending.withIndex()) {
-            currentCoroutineContext().ensureActive()
-            onProgress(Progress(i, pending.size, failed, item.name, 0, item.size, bytesPerSecond = meter.bytesPerSecond))
-            var lastReport = 0L
-            var fileSent = 0L
-            val onBytes: suspend (Long) -> Unit = { sent ->
-                runBytes += sent - fileSent
-                fileSent = sent
-                val rate = meter.update(runBytes)
-                // Progress goes through WorkManager's database, so report a few times a second at most.
-                val now = System.currentTimeMillis()
-                if (now - lastReport >= PROGRESS_INTERVAL_MS || sent >= item.size) {
-                    lastReport = now
-                    onProgress(Progress(i, pending.size, failed, item.name, sent, item.size, bytesPerSecond = rate))
-                }
-            }
-            try {
-                // The block re-opens the input itself, so NasClient's reconnect-and-retry is safe.
-                val sent = nas.withShare { share ->
-                    // A retry restarts the file, so don't count the failed attempt's bytes twice.
-                    runBytes -= fileSent
-                    fileSent = 0
-                    backupOne(share, config, item, cache, overwrite[item.id], onBytes)
-                }
-                if (sent) uploaded++ else alreadyThere++
-                consecutiveFailures = 0
-            } catch (e: CancellationException) {
-                throw e
-            } catch (e: NasNotConfiguredException) {
-                throw e
-            } catch (e: FileNotFoundException) {
-                // Deleted from the phone since the list was loaded; nothing to back up.
-                continue
-            } catch (e: Exception) {
-                failed++
-                consecutiveFailures++
-                lastError = "${item.name}: ${NasClient.describe(e)}"
-                if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
-                    aborted = true
-                    break
+        val workers = List(minOf(parallel, pending.size.coerceAtLeast(1))) {
+            launch {
+                for (item in queue) {
+                    if (run.aborted) break
+                    run.start(item)
+                    var fileSent = 0L
+                    try {
+                        // The block re-opens the input itself, so NasClient's reconnect-and-retry is safe.
+                        val sent = nas.withShare { share ->
+                            run.restart(item, fileSent)
+                            fileSent = 0
+                            backupOne(share, config, item, cache, overwrite[item.id]) { s ->
+                                val previous = fileSent
+                                fileSent = s
+                                run.bytes(item, s, previous)
+                            }
+                        }
+                        run.finished(item, sent)
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: NasNotConfiguredException) {
+                        throw e
+                    } catch (e: FileNotFoundException) {
+                        // Deleted from the phone since the list was loaded; nothing to back up.
+                        run.skipped(item)
+                    } catch (e: Exception) {
+                        run.failed(item, "${item.name}: ${NasClient.describe(e)}")
+                    }
                 }
             }
         }
-        onProgress(Progress(pending.size, pending.size, failed, null))
-        return Summary(uploaded, alreadyThere, failed, aborted, lastError)
+        workers.joinAll()
+        onProgress(Progress(pending.size, pending.size, run.failed, null))
+        Summary(
+            uploaded = run.uploaded,
+            alreadyThere = run.alreadyThere,
+            failed = run.failed,
+            aborted = run.aborted,
+            lastError = run.lastError,
+            bytesUploaded = run.runBytes,
+            errors = run.errors.toList(),
+        )
     }
 
     /**
@@ -197,6 +299,7 @@ class BackupEngine(
             openOriginal(item).use { NasClient.upload(share, it, overwritePath, item.modifiedAt, replace = true, onBytes) }
             cache.put(dir, RemoteFile(NasPath.name(overwritePath), item.size, item.modifiedAt))
             index.mark(item.id, overwritePath, item.size)
+            index.clearDamaged(item.id)
             return true
         }
 
@@ -244,7 +347,7 @@ class BackupEngine(
     private suspend fun isSameFile(share: DiskShare, item: MediaItem, path: String, remote: RemoteFile): Boolean {
         if (remote.size != item.size) return false
         if (item.modifiedAt > 0 && abs(remote.modifiedAt - item.modifiedAt) <= TIME_TOLERANCE_MS) return true
-        val same = openOriginal(item).use { localSha256(it) }.contentEquals(NasClient.sha256(share, path))
+        val same = openOriginal(item).use { NasClient.sha256(it) }.contentEquals(NasClient.sha256(share, path))
         if (same && item.modifiedAt > 0) runCatching { NasClient.setModified(share, path, item.modifiedAt) }
         return same
     }
@@ -278,10 +381,11 @@ class BackupEngine(
     // --- Check backups ------------------------------------------------------------------
 
     /**
-     * "Check backups": makes sure everything marked as backed up really is on the NAS.
+     * "Check backups": makes sure everything marked as backed up is really on the NAS.
      * Quick checks name and size from folder listings; [full] also reads every copy back and
-     * compares it byte for byte. With [repair], anything missing or different is uploaded again
-     * (a damaged copy is replaced in place). Never deletes anything.
+     * compares it byte for byte. Damaged copies are remembered so the next backup replaces
+     * them; with [repair], that happens now, and anything missing is uploaded again.
+     * Never deletes anything.
      */
     suspend fun check(
         items: List<MediaItem>,
@@ -296,48 +400,35 @@ class BackupEngine(
 
         // 1. Presence and size, from one listing per folder.
         val missingIds = forgetMissing(config, marked, cache).toHashSet()
+        val present = marked.filter { it.id !in missingIds }
 
         // 2. Content, file by file (full only).
         val damaged = HashMap<Long, String>() // id -> path of the bad copy
+        var matched = 0
         var unreadable = 0
         if (full) {
             val recorded = index.entries()
-            val meter = RateMeter()
-            var runBytes = 0L
-            val present = marked.filter { it.id !in missingIds }
+            val transfer = Transfer()
             for ((i, item) in present.withIndex()) {
                 currentCoroutineContext().ensureActive()
-                onProgress(Progress(i, present.size, 0, item.name, 0, item.size, Phase.Check, meter.bytesPerSecond))
                 val path = recorded[item.id]?.first ?: continue
                 try {
-                    val local = openOriginal(item).use { localSha256(it) }
-                    var lastReport = 0L
-                    var fileRead = 0L
-                    val remote = nas.withShare { share ->
-                        runBytes -= fileRead
-                        fileRead = 0
-                        NasClient.sha256(share, path) { read ->
-                            runBytes += read - fileRead
-                            fileRead = read
-                            val rate = meter.update(runBytes)
-                            val now = System.currentTimeMillis()
-                            if (now - lastReport >= PROGRESS_INTERVAL_MS) {
-                                lastReport = now
-                                onProgress(Progress(i, present.size, 0, item.name, read, item.size, Phase.Check, rate))
-                            }
-                        }
-                    }
-                    if (!local.contentEquals(remote)) damaged[item.id] = path
+                    if (readBackMatches(item, path, Phase.Check, i, present.size, transfer, onProgress)) matched++
+                    else damaged[item.id] = path
                 } catch (e: CancellationException) {
                     throw e
                 } catch (e: FileNotFoundException) {
-                    // Gone from the phone meanwhile; nothing to compare.
+                    // Gone from the phone meanwhile; nothing to compare (counted as skipped).
                 } catch (e: Exception) {
                     unreadable++
                 }
             }
+            // Unmark them, and remember them: their name, size and time still match, so a
+            // normal backup would otherwise take the damaged copy as good.
             index.remove(damaged.keys)
+            index.markDamaged(damaged)
         } else {
+            matched = present.size
             onProgress(Progress(marked.size, marked.size, 0, null, phase = Phase.Check))
         }
 
@@ -346,25 +437,29 @@ class BackupEngine(
         var repairFailed = 0
         var aborted = false
         var lastError: String? = null
+        var repairErrors: List<String> = emptyList()
         if (repair && (missingIds.isNotEmpty() || damaged.isNotEmpty())) {
             val toFix = marked.filter { it.id in missingIds || it.id in damaged }
-            val s = uploadAll(config, toFix, cache, overwrite = damaged, onProgress = onProgress)
+            val s = uploadAll(config, toFix, cache, overwrite = index.damaged(), onProgress = onProgress)
             repaired = s.uploaded + s.alreadyThere
             repairFailed = s.failed
             aborted = s.aborted
             lastError = s.lastError
+            repairErrors = s.errors
         }
 
         CheckReport(
             checked = marked.size,
-            ok = marked.size - missingIds.size - damaged.size - unreadable,
+            ok = matched,
             missing = missingIds.size,
             different = damaged.size,
             unreadable = unreadable,
+            skipped = marked.size - missingIds.size - matched - damaged.size - unreadable,
             repaired = repaired,
             repairFailed = repairFailed,
             aborted = aborted,
             lastError = lastError,
+            errors = repairErrors,
         )
     }
 
@@ -379,33 +474,13 @@ class BackupEngine(
         lock.withLock {
             val recorded = index.entries()
             val verified = HashSet<Long>()
-            val meter = RateMeter()
-            var runBytes = 0L
+            val transfer = Transfer()
             for ((i, item) in items.withIndex()) {
                 currentCoroutineContext().ensureActive()
-                onProgress(Progress(i, items.size, 0, item.name, 0, item.size, Phase.Verify, meter.bytesPerSecond))
                 val (path, size) = recorded[item.id] ?: continue
                 if (size != item.size) continue
                 try {
-                    val local = openOriginal(item).use { localSha256(it) }
-                    var lastReport = 0L
-                    var fileRead = 0L
-                    // A fresh digest per attempt: NasClient may retry the read after a reconnect.
-                    val remote = nas.withShare { share ->
-                        runBytes -= fileRead
-                        fileRead = 0
-                        NasClient.sha256(share, path) { read ->
-                            runBytes += read - fileRead
-                            fileRead = read
-                            val rate = meter.update(runBytes)
-                            val now = System.currentTimeMillis()
-                            if (now - lastReport >= PROGRESS_INTERVAL_MS) {
-                                lastReport = now
-                                onProgress(Progress(i, items.size, 0, item.name, read, item.size, Phase.Verify, rate))
-                            }
-                        }
-                    }
-                    if (local.contentEquals(remote)) verified += item.id
+                    if (readBackMatches(item, path, Phase.Verify, i, items.size, transfer, onProgress)) verified += item.id
                 } catch (e: CancellationException) {
                     throw e
                 } catch (e: Exception) {
@@ -416,18 +491,48 @@ class BackupEngine(
             verified
         }
 
-    // --- Helpers -------------------------------------------------------------------------
-
-    private fun localSha256(input: InputStream): ByteArray {
-        val md = MessageDigest.getInstance("SHA-256")
-        val buf = ByteArray(NasClient.BUFFER)
-        while (true) {
-            val n = input.read(buf)
-            if (n < 0) break
-            md.update(buf, 0, n)
-        }
-        return md.digest()
+    /** Bytes moved across a whole run, for its transfer rate. */
+    private class Transfer {
+        val meter = RateMeter()
+        var runBytes = 0L
     }
+
+    /**
+     * Reads the NAS copy at [path] back and compares it with the phone's file by SHA-256,
+     * reporting progress and transfer rate as item [i] of [total] in [phase].
+     */
+    private suspend fun readBackMatches(
+        item: MediaItem,
+        path: String,
+        phase: Phase,
+        i: Int,
+        total: Int,
+        transfer: Transfer,
+        onProgress: suspend (Progress) -> Unit,
+    ): Boolean {
+        onProgress(Progress(i, total, 0, item.name, 0, item.size, phase, transfer.meter.bytesPerSecond))
+        val local = openOriginal(item).use { NasClient.sha256(it) }
+        var lastReport = 0L
+        var fileRead = 0L
+        val remote = nas.withShare { share ->
+            // A retry starts the file again; a fresh digest is made per attempt.
+            transfer.runBytes -= fileRead
+            fileRead = 0
+            NasClient.sha256(share, path) { read ->
+                transfer.runBytes += read - fileRead
+                fileRead = read
+                val rate = transfer.meter.update(transfer.runBytes)
+                val now = System.currentTimeMillis()
+                if (now - lastReport >= PROGRESS_INTERVAL_MS || read >= item.size) {
+                    lastReport = now
+                    onProgress(Progress(i, total, 0, item.name, read, item.size, phase, rate))
+                }
+            }
+        }
+        return local.contentEquals(remote)
+    }
+
+    // --- Helpers -------------------------------------------------------------------------
 
     /**
      * Opens the unredacted file so photo GPS data survives the backup. Falls back to the
@@ -454,6 +559,7 @@ class BackupEngine(
 
     private companion object {
         const val MAX_CONSECUTIVE_FAILURES = 3
+        const val MAX_ERRORS_KEPT = 50
         const val PROGRESS_INTERVAL_MS = 300L
         /** SMB servers store times at 100 ns to 2 s precision (FAT-style), so allow a little slack. */
         const val TIME_TOLERANCE_MS = 2_000L

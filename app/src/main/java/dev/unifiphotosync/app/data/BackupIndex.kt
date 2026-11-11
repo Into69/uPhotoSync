@@ -14,7 +14,7 @@ import kotlinx.coroutines.flow.update
  * kept so an edited photo (new size) gets uploaded again.
  */
 class BackupIndex(context: Context) :
-    SQLiteOpenHelper(context, "backup_index.db", null, 1) {
+    SQLiteOpenHelper(context, "backup_index.db", null, 2) {
 
     override fun onCreate(db: SQLiteDatabase) {
         db.execSQL(
@@ -24,9 +24,52 @@ class BackupIndex(context: Context) :
                 "size INTEGER NOT NULL, " +
                 "backed_up_at INTEGER NOT NULL)"
         )
+        createDamaged(db)
     }
 
-    override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) = Unit
+    override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
+        if (oldVersion < 2) createDamaged(db)
+    }
+
+    /**
+     * NAS copies a full check found to differ from the phone. They have the right name, size
+     * and time, so a normal backup would take them as identical; listing them here makes the
+     * next backup replace them instead.
+     */
+    private fun createDamaged(db: SQLiteDatabase) {
+        db.execSQL("CREATE TABLE IF NOT EXISTS damaged(media_id INTEGER PRIMARY KEY, remote_path TEXT NOT NULL)")
+    }
+
+    /** media id -> path of its damaged NAS copy, to be replaced on the next backup. */
+    fun damaged(): Map<Long, String> {
+        val map = HashMap<Long, String>()
+        readableDatabase.rawQuery("SELECT media_id, remote_path FROM damaged", null).use { c ->
+            while (c.moveToNext()) map[c.getLong(0)] = c.getString(1)
+        }
+        return map
+    }
+
+    fun markDamaged(copies: Map<Long, String>) {
+        if (copies.isEmpty()) return
+        val db = writableDatabase
+        db.beginTransaction()
+        try {
+            copies.forEach { (id, path) ->
+                db.insertWithOnConflict(
+                    "damaged", null,
+                    ContentValues().apply { put("media_id", id); put("remote_path", path) },
+                    SQLiteDatabase.CONFLICT_REPLACE,
+                )
+            }
+            db.setTransactionSuccessful()
+        } finally {
+            db.endTransaction()
+        }
+    }
+
+    fun clearDamaged(mediaId: Long) {
+        writableDatabase.delete("damaged", "media_id = ?", arrayOf(mediaId.toString()))
+    }
 
     private val _sizes = MutableStateFlow<Map<Long, Long>>(emptyMap())
     private var loaded = false
@@ -94,7 +137,7 @@ class BackupIndex(context: Context) :
      * Forgets uploads stored at [path] on the NAS, or anywhere under it if it's a folder,
      * after they were deleted there. Their photos show as not backed up straight away.
      */
-    fun forgetRemote(path: String) {
+    fun forgetRemote(path: String): List<Long> {
         ensureLoaded()
         val clean = NasPath.clean(path)
         // SMB paths are case-insensitive. ESCAPE keeps _ and % in names literal.
@@ -105,11 +148,13 @@ class BackupIndex(context: Context) :
             arrayOf(clean.lowercase(), "$escaped\\%"),
         ).use { c -> while (c.moveToNext()) removed += c.getLong(0) }
         remove(removed)
+        return removed
     }
 
     @Synchronized
     fun clear() {
         writableDatabase.delete("backed_up", null, null)
+        writableDatabase.delete("damaged", null, null)
         _sizes.value = emptyMap()
         loaded = true
     }

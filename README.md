@@ -26,11 +26,19 @@ To install it, open the APK on your phone. If Android asks, allow your browser o
 - **Delete:** long-press to select, then delete.
   - **On the phone:** frees up space; the NAS copy stays. You're warned if something isn't backed up yet.
   - **On the NAS:** files or whole folders. Anything still on the phone is uploaded again on the next backup.
+- **Safety nets:**
+  - **Phone deletes go to Android's trash** (Android 11+), restorable for 30 days.
+  - **NAS deletes go to a `.recycle` folder** at the top of the share, emptied after 30 days.
+  - Both can be switched off in Settings.
+- **Encrypted connection:** optional SMB3 encryption. "Test connection" shows whether your NAS supports it.
+- **Backup history:** Settings → History lists recent backups, moves, checks and downloads, with timings, data transferred and any errors.
+- **Viewer:** a full-screen photo viewer for the phone and the NAS. Swipe between photos, pinch or double-tap to zoom. The Device tab groups photos by month.
 - **Thumbnails or details:** switch either tab between a grid and a list showing date, size and backup status.
 - **Automatic backup:** new photos are uploaded shortly after you take them, and a full check runs every 6 hours.
 - **Scheduled backup:** back up everything at a time you choose (for example 2:00 AM) on the days you pick. Android may start it a few minutes late if the phone is idle. A silent notification shows while it runs, then is replaced by a report, e.g. "12 files uploaded in 3 min" or why it was skipped or failed.
 - **Conditions:** both kinds can be limited to Wi-Fi only or charging only, and to the albums you choose. Wi-Fi only can be narrowed further to specific networks by name, so backups only run at home.
 - **Progress:** one bar for the current file (bytes sent) and one for the whole job, with the current transfer rate.
+- **Parallel uploads:** up to 4 files at once (default 3), which is much faster for lots of small photos.
 - **Skips what's already there:** each NAS folder is listed once per run. Uploaded copies carry the phone file's modified time, so a file with the same name, size and time is skipped without any extra transfer. Only same-size files with a different time are compared by content (SHA-256).
 - **Check backups** (Settings → Maintenance): confirms everything marked as backed up is really on the NAS.
   - **Quick** checks names and sizes, in seconds.

@@ -20,6 +20,8 @@ data class NasConfig(
     val domain: String = "",
     /** Folder inside the share that backups go to, chosen by the user; empty means the share root. */
     val destination: String = "",
+    /** Require SMB3 encryption, so other devices on the network can't read the traffic. */
+    val encrypt: Boolean = false,
 ) {
     val isComplete get() = host.isNotBlank() && share.isNotBlank() && username.isNotBlank()
 
@@ -66,6 +68,12 @@ data class BackupPrefs(
     val scheduleDays: Set<Int> = (1..7).toSet(),
     /** With [unmeteredOnly]: only these Wi-Fi networks (SSIDs); empty means any Wi-Fi. */
     val wifiSsids: Set<String> = emptySet(),
+    /** Phone deletes go to Android's trash (recoverable for 30 days) where supported (Android 11+). */
+    val phoneTrash: Boolean = true,
+    /** NAS deletes go to a .recycle folder in the share, emptied after 30 days. */
+    val nasRecycle: Boolean = true,
+    /** Files uploaded at the same time (1-4); more helps with many small photos. */
+    val parallelUploads: Int = 3,
 ) {
     /** True when automatic backups are limited to specific Wi-Fi names. */
     val ssidRestricted get() = unmeteredOnly && wifiSsids.isNotEmpty()
@@ -82,6 +90,7 @@ class SettingsStore(private val context: Context) {
         val password = stringPreferencesKey("password_enc")
         val domain = stringPreferencesKey("domain")
         val destination = stringPreferencesKey("destination")
+        val encrypt = booleanPreferencesKey("encrypt")
         val autoBackup = booleanPreferencesKey("auto_backup")
         val unmeteredOnly = booleanPreferencesKey("unmetered_only")
         val chargingOnly = booleanPreferencesKey("charging_only")
@@ -90,6 +99,9 @@ class SettingsStore(private val context: Context) {
         val scheduleMinutes = intPreferencesKey("schedule_minutes")
         val scheduleDays = stringSetPreferencesKey("schedule_days")
         val wifiSsids = stringSetPreferencesKey("wifi_ssids")
+        val phoneTrash = booleanPreferencesKey("phone_trash")
+        val nasRecycle = booleanPreferencesKey("nas_recycle")
+        val parallelUploads = intPreferencesKey("parallel_uploads")
     }
 
     /** Thumbnails or details for a browser screen, remembered per [screen] ("device", "nas"). */
@@ -112,6 +124,7 @@ class SettingsStore(private val context: Context) {
             password = p[Keys.password]?.let(SecretBox::decrypt).orEmpty(),
             domain = p[Keys.domain].orEmpty(),
             destination = p[Keys.destination].orEmpty(),
+            encrypt = p[Keys.encrypt] ?: false,
         )
     }
 
@@ -128,6 +141,9 @@ class SettingsStore(private val context: Context) {
             scheduleMinutes = p[Keys.scheduleMinutes] ?: 2 * 60,
             scheduleDays = p[Keys.scheduleDays]?.mapNotNull { it.toIntOrNull() }?.toSet() ?: (1..7).toSet(),
             wifiSsids = p[Keys.wifiSsids] ?: emptySet(),
+            phoneTrash = p[Keys.phoneTrash] ?: true,
+            nasRecycle = p[Keys.nasRecycle] ?: true,
+            parallelUploads = (p[Keys.parallelUploads] ?: 3).coerceIn(1, 4),
         )
     }
 
@@ -139,6 +155,7 @@ class SettingsStore(private val context: Context) {
             p[Keys.password] = SecretBox.encrypt(c.password)
             p[Keys.domain] = c.domain.trim()
             p[Keys.destination] = NasPath.clean(c.destination)
+            p[Keys.encrypt] = c.encrypt
         }
     }
 
@@ -152,6 +169,9 @@ class SettingsStore(private val context: Context) {
             p[Keys.scheduleMinutes] = b.scheduleMinutes
             p[Keys.scheduleDays] = b.scheduleDays.mapTo(HashSet()) { it.toString() }
             p[Keys.wifiSsids] = b.wifiSsids
+            p[Keys.phoneTrash] = b.phoneTrash
+            p[Keys.nasRecycle] = b.nasRecycle
+            p[Keys.parallelUploads] = b.parallelUploads.coerceIn(1, 4)
         }
     }
 }

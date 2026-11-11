@@ -62,6 +62,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextAlign
@@ -87,6 +88,7 @@ import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 
@@ -119,6 +121,10 @@ class NasViewModel(app: Application) : AndroidViewModel(app) {
         .stateIn(viewModelScope, SharingStarted.Eagerly, ViewMode.Thumbnails)
 
     fun setViewMode(mode: ViewMode) = viewModelScope.launch { graph.settings.setViewMode("nas", mode) }
+
+    /** NAS deletes go to the .recycle folder for 30 days (Settings). */
+    val recycleOn = graph.settings.prefs.map { it.nasRecycle }
+        .stateIn(viewModelScope, SharingStarted.Eagerly, true)
 
     /** Opens the backup folder the first time the tab is shown. */
     fun start() {
@@ -184,13 +190,22 @@ class NasViewModel(app: Application) : AndroidViewModel(app) {
         if (entries.isEmpty() || _state.value.deleting) return
         _state.update { it.copy(deleting = true) }
         viewModelScope.launch {
-            val result = runCatching { graph.nas.delete(entries) }
+            val recycle = graph.settings.prefs.first().nasRecycle
+            val result = runCatching { graph.nas.delete(entries, recycle) }
             // Forget every attempted path: if one survived, the next backup just finds it and re-records it.
-            withContext(Dispatchers.IO) { entries.forEach { graph.index.forgetRemote(it.path) } }
+            withContext(Dispatchers.IO) {
+                val forgotten = entries.flatMap { graph.index.forgetRemote(it.path) }
+                // Their NAS copy is gone, so a pending Move must not delete them from the phone.
+                graph.moves.remove(forgotten)
+            }
             _state.update { it.copy(deleting = false, selected = emptySet()) }
             messages.tryEmit(
                 result.fold(
-                    { n -> "Deleted $n ${if (n == 1) "item" else "items"} from the NAS" },
+                    { n ->
+                        val items = if (n == 1) "item" else "items"
+                        if (recycle && entries.none { NasClient.isInRecycle(it.path) }) "Moved $n $items to the NAS recycle folder"
+                        else "Deleted $n $items from the NAS"
+                    },
                     { e -> "Delete failed: ${NasClient.describe(e)}" },
                 )
             )
@@ -359,35 +374,40 @@ fun NasScreen(onOpenSettings: () -> Unit, vm: NasViewModel = viewModel()) {
     }
 
     preview?.let { e ->
-        AlertDialog(
-            onDismissRequest = { preview = null },
-            title = { Text(e.name, maxLines = 2, overflow = TextOverflow.Ellipsis) },
-            text = {
-                Column {
-                    if (e.isImage) {
-                        AsyncImage(
-                            model = NasFile(e.path, e.size, e.modifiedAt),
-                            contentDescription = e.name,
-                            contentScale = ContentScale.Fit,
-                            modifier = Modifier.fillMaxWidth().heightIn(max = 400.dp),
-                        )
-                    }
-                    Text(formatSize(e.size), style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(top = 8.dp))
+        // Swipe through the photos and videos in this folder.
+        val media = remember(state.entries) { state.entries.filter { it.isImage || it.isVideo } }
+        val viewerItems = remember(media) {
+            media.map {
+                ViewerItem(
+                    key = it.path,
+                    // NAS videos have no preview (it would mean downloading the whole file).
+                    model = if (it.isImage) NasFile(it.path, it.size, it.modifiedAt) else null,
+                    title = it.name,
+                    subtitle = "${formatDate(it.modifiedAt)} · ${formatSize(it.size)}" +
+                        if (it.isVideo) " · Save to phone to play" else "",
+                    isVideo = it.isVideo,
+                )
+            }
+        }
+        MediaViewer(
+            items = viewerItems,
+            startIndex = media.indexOfFirst { it.path == e.path }.coerceAtLeast(0),
+            onDismiss = { preview = null },
+        ) { current ->
+            val entry = media.firstOrNull { it.path == current.key }
+            if (entry != null) {
+                TextButton(onClick = { vm.download(entry) }) { Text("Save to phone", color = Color.White) }
+                TextButton(onClick = { confirmDelete = listOf(entry); preview = null }) {
+                    Text("Delete", color = Color.White)
                 }
-            },
-            confirmButton = {
-                TextButton(onClick = { vm.download(e); preview = null }) { Text("Save to phone") }
-            },
-            dismissButton = {
-                Row {
-                    TextButton(onClick = { confirmDelete = listOf(e); preview = null }) { Text("Delete") }
-                    TextButton(onClick = { preview = null }) { Text("Close") }
-                }
-            },
-        )
+            }
+        }
     }
 
     confirmDelete?.let { targets ->
+        val recycleOn by vm.recycleOn.collectAsStateWithLifecycle()
+        // Deleting from inside .recycle itself is always for good.
+        val toRecycle = recycleOn && targets.none { NasClient.isInRecycle(it.path) }
         val folders = targets.count { it.isDirectory }
         val files = targets.size - folders
         AlertDialog(
@@ -403,7 +423,12 @@ fun NasScreen(onOpenSettings: () -> Unit, vm: NasViewModel = viewModel()) {
                 Text(
                     buildString {
                         if (folders > 0) append("Folders are deleted with everything in them. ")
-                        append("This can't be undone from the app. ")
+                        if (toRecycle) {
+                            append("They'll be moved to the ${NasClient.RECYCLE_DIR} folder at the top of the share ")
+                            append("and removed for good after ${NasClient.RECYCLE_DAYS} days. ")
+                        } else {
+                            append("This can't be undone. ")
+                        }
                         append("Photos and videos still on this phone will be uploaded again on the next backup.")
                         if (targets.size > 1) append("\n\n$files ${if (files == 1) "file" else "files"}, $folders ${if (folders == 1) "folder" else "folders"}")
                     }
