@@ -49,6 +49,8 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.io.File
 
@@ -106,7 +108,15 @@ class UpdateViewModel(app: Application) : AndroidViewModel(app) {
                     val now = System.nanoTime()
                     if (now - lastAt >= 200_000_000L || done == total) {
                         lastAt = now
-                        _state.value = UpdateState.Downloading(release, done, total, rate)
+                        // This runs on the download thread. Only replace a Downloading state, and
+                        // only while not cancelled, so a late update can't undo Stop.
+                        _state.update { cur ->
+                            if (cur is UpdateState.Downloading && isActive) {
+                                UpdateState.Downloading(release, done, total, rate)
+                            } else {
+                                cur
+                            }
+                        }
                     }
                 }
                 UpdateState.Ready(release, apk)
@@ -117,6 +127,9 @@ class UpdateViewModel(app: Application) : AndroidViewModel(app) {
             }
         }
     }
+
+    /** Sent to Android's "Install unknown apps" page; install this when they come back allowed. */
+    var installAfterAllow: File? = null
 
     fun autoInstallStarted() {
         (_state.value as? UpdateState.Ready)?.let { _state.value = it.copy(autoInstall = false) }
@@ -134,20 +147,22 @@ fun AppUpdatesPanel(vm: UpdateViewModel = viewModel()) {
     val state by vm.state.collectAsStateWithLifecycle()
     val context = LocalContext.current
     var notesFor by remember { mutableStateOf<Updater.Release?>(null) }
-    // Sent to Android's "Install unknown apps" page; install as soon as they come back allowed.
-    var installAfterAllow by remember { mutableStateOf<File?>(null) }
+    // Whether Android lets this app install apps; it can change on the system settings page,
+    // so it's re-read every time the screen comes back.
+    var canInstall by remember { mutableStateOf(vm.updater.canInstall()) }
     fun install(apk: File) {
         if (vm.updater.canInstall()) {
             context.startActivity(vm.updater.installIntent(apk))
         } else {
-            installAfterAllow = apk
+            vm.installAfterAllow = apk
             context.startActivity(vm.updater.allowInstallsIntent())
         }
     }
     LifecycleEventEffect(Lifecycle.Event.ON_RESUME) {
-        installAfterAllow?.let { apk ->
-            installAfterAllow = null
-            if (vm.updater.canInstall() && apk.exists()) context.startActivity(vm.updater.installIntent(apk))
+        canInstall = vm.updater.canInstall()
+        vm.installAfterAllow?.let { apk ->
+            vm.installAfterAllow = null
+            if (canInstall && apk.exists()) context.startActivity(vm.updater.installIntent(apk))
         }
     }
 
@@ -188,7 +203,7 @@ fun AppUpdatesPanel(vm: UpdateViewModel = viewModel()) {
             }
             else -> Unit
         }
-        if (state is UpdateState.Ready && !vm.updater.canInstall()) {
+        if (state is UpdateState.Ready && !canInstall) {
             Text(
                 "Android will ask you to allow uPhotoSync to install apps. Turn it on, then come back.",
                 style = MaterialTheme.typography.bodySmall,
