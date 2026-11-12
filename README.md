@@ -27,6 +27,8 @@ Get **`uPhotoSync.apk`** from the [Releases page](https://github.com/Into69/uPho
 
 To install it, open the APK on your phone. If Android asks, allow your browser or file manager to install apps. You need **Android 10 or newer**.
 
+After that, the app can update itself: **Settings → App updates → Check for updates** finds the newest release on GitHub, downloads it and opens Android's installer. The first time, Android asks you to allow uPhotoSync to install apps. Updates only install over a build signed with the same key, so a build you compiled yourself won't take an official update (or the other way round) without uninstalling first.
+
 > This is an early build: it hasn't been widely tested yet, on UNAS or other SMB servers. Please [open an issue](https://github.com/Into69/uPhotoSync/issues) if something doesn't work, and say which NAS or server you're using.
 
 ## Features

@@ -234,8 +234,9 @@ private fun RunningContent(s: BackupStatus, onStop: () -> Unit) {
     }
 }
 
+/** Icon, title and subtitle row used by transfer banners (backups, app updates). */
 @Composable
-private fun Header(icon: ImageVector, title: String, subtitle: String?, busy: Boolean, onStop: (() -> Unit)?) {
+internal fun Header(icon: ImageVector, title: String, subtitle: String?, busy: Boolean, onStop: (() -> Unit)?) {
     Row(verticalAlignment = Alignment.CenterVertically) {
         // Icon in a tinted circle; it gently pulses while work is running.
         val pulse = if (busy) {
@@ -310,7 +311,7 @@ private fun FileRow(f: FileTransfer) {
 
 /** Rounded progress bar with no end marker; [progress] null means "working, amount unknown". */
 @Composable
-private fun SmoothBar(progress: Float?, height: Dp, modifier: Modifier = Modifier) {
+internal fun SmoothBar(progress: Float?, height: Dp, modifier: Modifier = Modifier) {
     val trackColor = MaterialTheme.colorScheme.surfaceVariant
     if (progress == null) {
         LinearProgressIndicator(
@@ -330,7 +331,7 @@ private fun SmoothBar(progress: Float?, height: Dp, modifier: Modifier = Modifie
     }
 }
 
-private fun timeLeft(seconds: Long): String = when {
+internal fun timeLeft(seconds: Long): String = when {
     seconds < 60 -> "less than a minute left"
     seconds < 3600 -> "~${(seconds + 30) / 60} min left"
     else -> "~${seconds / 3600} h ${seconds % 3600 / 60} min left"

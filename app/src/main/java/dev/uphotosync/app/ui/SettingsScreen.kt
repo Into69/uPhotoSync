@@ -440,6 +440,10 @@ fun SettingsScreen(vm: SettingsViewModel = viewModel()) {
                     OutlinedButton(onClick = { showHistory = true }) { Text("History") }
                     TextButton(onClick = { confirmReset = true }) { Text("Reset history") }
                 }
+
+                HorizontalDivider(Modifier.padding(vertical = 8.dp))
+                Section("App updates")
+                AppUpdatesPanel()
             }
         }
     }
