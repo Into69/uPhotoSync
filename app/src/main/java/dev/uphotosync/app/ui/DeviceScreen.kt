@@ -226,8 +226,22 @@ class DeviceViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /** While the screen isn't showing, changes only mark the list stale; it reloads on return. */
+    private var onScreen = true
+    private var stale = false
+
+    fun setOnScreen(visible: Boolean) {
+        onScreen = visible
+        if (visible && stale) {
+            stale = false
+            reload()
+        }
+    }
+
     private val observer = object : ContentObserver(Handler(Looper.getMainLooper())) {
-        override fun onChange(selfChange: Boolean) = reload(debounce = true)
+        override fun onChange(selfChange: Boolean) {
+            if (onScreen) reload(debounce = true) else stale = true
+        }
     }
 
     init {
@@ -428,6 +442,8 @@ fun DeviceScreen(onOpenSettings: () -> Unit, vm: DeviceViewModel = viewModel()) 
         if (granted) vm.reload() else launcher.launch(AppPermissions.firstLaunchRequest())
     }
     // Access can change in system settings while the app is in the background.
+    LifecycleEventEffect(Lifecycle.Event.ON_START) { vm.setOnScreen(true) }
+    LifecycleEventEffect(Lifecycle.Event.ON_STOP) { vm.setOnScreen(false) }
     LifecycleEventEffect(Lifecycle.Event.ON_RESUME) {
         val now = AppPermissions.mediaAccess(context)
         if (now != access) {

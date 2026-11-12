@@ -52,7 +52,7 @@ To install it, open the APK on your phone. If Android asks, allow your browser o
 - **Crash reports:** if the app crashes, the next launch offers to share the error details. Nothing is sent automatically.
 - **Thumbnails or details:** switch either tab between a grid and a list showing date, size and backup status.
 - **Automatic backup:** new photos are uploaded shortly after you take them, and a full check runs every 6 hours.
-- **Scheduled backup:** back up everything at a time you choose (for example 2:00 AM) on the days you pick. Android may start it a few minutes late if the phone is idle. A silent notification shows while it runs, then is replaced by a report, e.g. "12 files uploaded in 3 min" or why it was skipped or failed.
+- **Scheduled backup:** back up everything at a time you choose (for example 2:00 AM) on the days you pick. Android may start it a few minutes late if the phone is idle. If it can't start within the window you set (1–6 hours, default 1), for example because "only while charging" is on and the phone wasn't plugged in, that day's run is skipped and noted in History. A run that has started is never cut off, however long it takes. A silent notification shows while it runs, then is replaced by a report, e.g. "12 files uploaded in 3 min" or why it was skipped or failed.
 - **Conditions:** both kinds can be limited to Wi-Fi only or charging only, and to the albums you choose. Wi-Fi only can be narrowed further to specific networks by name, so backups only run at home.
 - **Progress:** one bar for the current file (bytes sent) and one for the whole job, with the current transfer rate.
 - **Parallel uploads:** up to 4 files at once (default 3), which is much faster for lots of small photos.

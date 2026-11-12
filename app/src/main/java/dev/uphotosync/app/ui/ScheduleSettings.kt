@@ -74,6 +74,28 @@ fun ScheduleSettings(prefs: BackupPrefs, onChange: (BackupPrefs) -> Unit) {
                     )
                 }
             }
+            // How late a run may still start (e.g. waiting to be plugged in) before that day is skipped.
+            Text(
+                "Start within",
+                style = MaterialTheme.typography.bodyMedium,
+                modifier = Modifier.padding(top = 8.dp),
+            )
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                listOf(1, 2, 3, 4, 6).forEach { hours ->
+                    FilterChip(
+                        selected = prefs.scheduleWindowHours == hours,
+                        onClick = { onChange(prefs.copy(scheduleWindowHours = hours)) },
+                        label = { Text("$hours h") },
+                    )
+                }
+            }
+            Text(
+                "If it can't start by " +
+                    BackupSchedule.formatTime((prefs.scheduleMinutes + prefs.scheduleWindowHours * 60) % (24 * 60)) +
+                    " (e.g. not plugged in), that day is skipped",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
             val next = BackupSchedule.next(LocalDateTime.now(), prefs.scheduleMinutes, prefs.scheduleDays)
             Text(
                 if (next == null) "Pick at least one day"

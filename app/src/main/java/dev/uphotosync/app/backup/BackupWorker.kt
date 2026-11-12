@@ -49,7 +49,18 @@ class BackupWorker(context: Context, params: WorkerParameters) : CoroutineWorker
             if (scheduled) {
                 // Daily job: only back up on the chosen days, near the chosen time. Off days are silent.
                 val prefs = graph.settings.prefs.first()
-                if (!BackupSchedule.isDue(LocalDateTime.now(), prefs.scheduleMinutes, prefs.scheduleDays)) {
+                val now = LocalDateTime.now()
+                if (!BackupSchedule.isDue(now, prefs.scheduleMinutes, prefs.scheduleDays, prefs.scheduleWindowHours.toLong())) {
+                    // Android held it back (not charging, no Wi-Fi...) past the start window:
+                    // skip today's run rather than start at an odd hour. Noted in history only.
+                    if (BackupSchedule.isDue(now, prefs.scheduleMinutes, prefs.scheduleDays, graceHours = 24)) {
+                        val window = prefs.scheduleWindowHours.let { if (it == 1) "1 hour" else "$it hours" }
+                        record(
+                            Outcome.Skipped,
+                            "Skipped: couldn't start within $window of ${BackupSchedule.formatTime(prefs.scheduleMinutes)}",
+                            startedAt,
+                        )
+                    }
                     return Result.success()
                 }
             }
@@ -68,6 +79,13 @@ class BackupWorker(context: Context, params: WorkerParameters) : CoroutineWorker
                     record(Outcome.Skipped, "Skipped: $why", startedAt)
                     return Result.success(stamped(KEY_SKIPPED to "Automatic backup skipped: $why"))
                 }
+            }
+
+            // The new-photo trigger also fires for edits, deletes and other apps' changes. With
+            // nothing new to send, finish without a notification or touching the NAS; the
+            // 6-hourly sweep still double-checks the NAS for files deleted there.
+            if (fromTrigger && selectItems(graph.media.loadAll(), idsFile).all(graph.index::isBackedUp)) {
+                return Result.success()
             }
 
             // Show that it's running straight away. Long backups need a foreground service;

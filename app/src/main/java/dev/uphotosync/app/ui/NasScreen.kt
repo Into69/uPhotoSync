@@ -231,6 +231,13 @@ class NasViewModel(app: Application) : AndroidViewModel(app) {
 
     private var prefetchJob: Job? = null
 
+    /** True while the NAS tab is on screen; background thumbnail prefetching waits otherwise. */
+    private val onScreen = MutableStateFlow(false)
+
+    fun setOnScreen(visible: Boolean) {
+        onScreen.value = visible
+    }
+
     private val _space = MutableStateFlow<StorageSpace?>(null)
 
     /** The share's size and free space, refreshed when a folder loads (and after deletes). */
@@ -261,7 +268,7 @@ class NasViewModel(app: Application) : AndroidViewModel(app) {
         val thumbs = entries
             .filter { it.isVideo || (it.isImage && it.size < MAX_THUMB_BYTES) }
             .map { NasThumb(it.path, it.size, it.modifiedAt) }
-        if (thumbs.isNotEmpty()) prefetchJob = graph.thumbnails.prefetch(thumbs, viewModelScope)
+        if (thumbs.isNotEmpty()) prefetchJob = graph.thumbnails.prefetch(thumbs, viewModelScope, onScreen)
     }
 
     fun up(): Boolean {
@@ -431,9 +438,14 @@ fun NasScreen(onOpenSettings: () -> Unit, vm: NasViewModel = viewModel()) {
     val lifecycle = LocalLifecycleOwner.current.lifecycle
     LaunchedEffect(lifecycle) {
         lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) {
-            while (true) {
-                vm.refreshSpace()
-                delay(SPACE_REFRESH_MS)
+            vm.setOnScreen(true)
+            try {
+                while (true) {
+                    vm.refreshSpace()
+                    delay(SPACE_REFRESH_MS)
+                }
+            } finally {
+                vm.setOnScreen(false)
             }
         }
     }

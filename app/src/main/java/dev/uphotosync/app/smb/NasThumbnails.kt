@@ -19,6 +19,8 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.StateFlow
 import dev.uphotosync.app.data.StorageSpace
 import okio.buffer
 import java.io.File
@@ -124,10 +126,11 @@ class NasThumbnails(private val context: Context, private val nas: NasClient) {
      * waiting, one at a time. Cancel the returned job when leaving the folder; a thumbnail that's
      * already downloading still finishes.
      */
-    fun prefetch(thumbs: List<NasThumb>, owner: CoroutineScope): Job = owner.launch(Dispatchers.IO) {
+    fun prefetch(thumbs: List<NasThumb>, owner: CoroutineScope, onScreen: StateFlow<Boolean>): Job = owner.launch(Dispatchers.IO) {
         // Only on Wi-Fi or other unmetered networks, and only so many per folder: a big folder
         // over mobile data or a VPN could otherwise pull many GB just by being open.
         for (thumb in thumbs.take(MAX_PREFETCH)) {
+            onScreen.first { it } // paused while the app is in the background
             gate.awaitIdle() // what's on screen comes first
             if (onMeteredNetwork()) break
             if (isCached(thumb)) continue

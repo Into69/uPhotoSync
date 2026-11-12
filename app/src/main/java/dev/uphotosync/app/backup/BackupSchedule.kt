@@ -27,10 +27,11 @@ object BackupSchedule {
 
     /**
      * Whether a run starting at [now] counts as the scheduled run for one of [days].
-     * Android may start the job late, so a run within [graceHours] after the set time on
-     * a selected day still counts, even if that pushed it past midnight.
+     * Android may start the job late (waiting for charging or Wi-Fi), so a run within
+     * [graceHours] after the set time on a selected day still counts, even if that pushed
+     * it past midnight. Later than that, the day's run is skipped.
      */
-    fun isDue(now: LocalDateTime, minutes: Int, days: Set<Int>, graceHours: Long = 6): Boolean =
+    fun isDue(now: LocalDateTime, minutes: Int, days: Set<Int>, graceHours: Long = 1): Boolean =
         (0L..1L).any { back ->
             val day = now.toLocalDate().minusDays(back)
             val target = day.atTime(LocalTime.of(minutes / 60 % 24, minutes % 60))

@@ -42,7 +42,8 @@ class BackupScheduleTest {
 
     @Test fun dueAtAndShortlyAfterTheTime() {
         assertTrue(BackupSchedule.isDue(at(10, 2), twoAm, everyDay))
-        assertTrue(BackupSchedule.isDue(at(10, 4, 30), twoAm, everyDay))
+        assertTrue(BackupSchedule.isDue(at(10, 2, 45), twoAm, everyDay))
+        assertTrue(BackupSchedule.isDue(at(10, 4, 30), twoAm, everyDay, graceHours = 3))
         assertTrue(BackupSchedule.isDue(at(10, 1, 50), twoAm, everyDay)) // a few minutes early is fine
     }
 
@@ -53,6 +54,15 @@ class BackupScheduleTest {
 
     @Test fun lateRunPastMidnightCountsForThePreviousDay() {
         // 23:30 on Tuesday only, delayed until 01:00 Wednesday: still Tuesday's run.
-        assertTrue(BackupSchedule.isDue(at(11, 1), 23 * 60 + 30, setOf(2)))
+        assertTrue(BackupSchedule.isDue(at(11, 1), 23 * 60 + 30, setOf(2), graceHours = 2))
+    }
+
+    @Test fun tooLateToStartIsSkipped() {
+        // Set for 2:00, plugged in at 5:00: outside the default 1-hour window and a 2-hour one.
+        assertFalse(BackupSchedule.isDue(at(10, 5), twoAm, everyDay))
+        assertFalse(BackupSchedule.isDue(at(10, 5), twoAm, everyDay, graceHours = 2))
+        assertFalse(BackupSchedule.isDue(at(10, 3), twoAm, everyDay)) // window ends at 3:00
+        // But it's still recognised as that day's (missed) run, for the history note.
+        assertTrue(BackupSchedule.isDue(at(10, 5), twoAm, everyDay, graceHours = 24))
     }
 }

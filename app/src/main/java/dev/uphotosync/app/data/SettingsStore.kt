@@ -78,6 +78,8 @@ data class BackupPrefs(
     val scheduleMinutes: Int = 2 * 60,
     /** ISO days of week (1 = Monday ... 7 = Sunday). */
     val scheduleDays: Set<Int> = (1..7).toSet(),
+    /** A scheduled run that can't start within this many hours of the set time is skipped for that day. */
+    val scheduleWindowHours: Int = 1,
     /** With [unmeteredOnly]: only these Wi-Fi networks (SSIDs); empty means any Wi-Fi. */
     val wifiSsids: Set<String> = emptySet(),
     /** Phone deletes go to Android's trash (recoverable for 30 days) where supported (Android 11+). */
@@ -110,6 +112,7 @@ class SettingsStore(private val context: Context) {
         val scheduled = booleanPreferencesKey("scheduled")
         val scheduleMinutes = intPreferencesKey("schedule_minutes")
         val scheduleDays = stringSetPreferencesKey("schedule_days")
+        val scheduleWindowHours = intPreferencesKey("schedule_window_hours")
         val wifiSsids = stringSetPreferencesKey("wifi_ssids")
         val phoneTrash = booleanPreferencesKey("phone_trash")
         val nasRecycle = booleanPreferencesKey("nas_recycle")
@@ -161,6 +164,7 @@ class SettingsStore(private val context: Context) {
             scheduled = p[Keys.scheduled] ?: false,
             scheduleMinutes = p[Keys.scheduleMinutes] ?: 2 * 60,
             scheduleDays = p[Keys.scheduleDays]?.mapNotNull { it.toIntOrNull() }?.toSet() ?: (1..7).toSet(),
+            scheduleWindowHours = (p[Keys.scheduleWindowHours] ?: 1).coerceIn(1, 12),
             wifiSsids = p[Keys.wifiSsids] ?: emptySet(),
             phoneTrash = p[Keys.phoneTrash] ?: true,
             nasRecycle = p[Keys.nasRecycle] ?: true,
@@ -189,6 +193,7 @@ class SettingsStore(private val context: Context) {
             p[Keys.scheduled] = b.scheduled
             p[Keys.scheduleMinutes] = b.scheduleMinutes
             p[Keys.scheduleDays] = b.scheduleDays.mapTo(HashSet()) { it.toString() }
+            p[Keys.scheduleWindowHours] = b.scheduleWindowHours.coerceIn(1, 12)
             p[Keys.wifiSsids] = b.wifiSsids
             p[Keys.phoneTrash] = b.phoneTrash
             p[Keys.nasRecycle] = b.nasRecycle
