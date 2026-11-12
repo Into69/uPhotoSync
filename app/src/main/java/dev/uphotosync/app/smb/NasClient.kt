@@ -221,10 +221,10 @@ class NasClient(private val settings: SettingsStore) {
                 }
                 val ctx = o.connection.connectionContext
                 val dialect = ctx.negotiatedProtocol?.dialect?.name?.removePrefix("SMB_")?.replace('_', '.')
-                val security = when {
-                    config.encrypt -> "encrypted"
-                    ctx.supportsEncryption() -> "encryption available: turn it on below"
-                    else -> "this NAS doesn't offer encryption"
+                val security = if (config.encrypt) "encrypted" else when (probeEncryption(config.host)) {
+                    true -> "encryption available"
+                    false -> "this NAS doesn't offer encryption"
+                    null -> "couldn't check encryption support"
                 }
                 "Connected to ${config.share} ($count items$baseNote)\n" +
                     listOfNotNull(dialect?.let { "SMB $it" }, security).joinToString(" · ")
@@ -233,6 +233,21 @@ class NasClient(private val settings: SettingsStore) {
             }
         }
     }
+
+    /**
+     * Whether [host] can do SMB3 encryption. smbj only reports encryption support when the
+     * client offered it too during negotiation, so a connection made with encryption off
+     * always says "no". This negotiates separately with an encryption-capable client
+     * (no login needed). Null if the probe itself failed.
+     */
+    private fun probeEncryption(host: String): Boolean? = runCatching {
+        val probe = client(true).connect(host)
+        try {
+            probe.connectionContext.supportsEncryption()
+        } finally {
+            runCatching { probe.close() }
+        }
+    }.getOrNull()
 
     suspend fun list(path: String): List<NasEntry> = withShare { share -> listOn(share, path) }
 
