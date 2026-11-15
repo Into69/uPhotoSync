@@ -1,0 +1,104 @@
+# Builds, tests and signs the release APK, then attaches it to the GitHub release.
+#
+# Runs when a release is published (e.g. `gh release create v0.1.15 --prerelease --notes "..."`),
+# or by hand from the Actions tab for an existing tag. The in-app updater only offers
+# releases that have the APK attached, so a release shows up in the app once this finishes.
+#
+# Needs these repository secrets (Settings > Secrets and variables > Actions):
+#   KEYSTORE_BASE64    the release keystore (.jks), base64-encoded
+#   KEYSTORE_PASSWORD  its store password
+#   KEY_ALIAS          the key alias (uphotosync)
+#   KEY_PASSWORD       the key password
+name: Release APK
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to build and attach the APK to (e.g. v0.1.15)"
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      - name: Check the tag matches versionName
+        run: |
+          version=$(sed -n 's/.*versionName = "\(.*\)".*/\1/p' app/build.gradle.kts)
+          if [ "v$version" != "$TAG" ]; then
+            echo "::error::Tag $TAG doesn't match versionName $version in app/build.gradle.kts"
+            exit 1
+          fi
+
+      - name: Set up the signing key
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          if [ -z "$KEYSTORE_BASE64" ]; then
+            echo "::error::The signing secrets aren't set, so the APK can't be signed. See the top of this file."
+            exit 1
+          fi
+          echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
+          {
+            echo "storeFile=$RUNNER_TEMP/release.jks"
+            echo "storePassword=$KEYSTORE_PASSWORD"
+            echo "keyAlias=$KEY_ALIAS"
+            echo "keyPassword=$KEY_PASSWORD"
+          } > keystore.properties
+
+      - name: Test and build
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon testDebugUnitTest assembleRelease
+
+      # Installed apps only accept updates signed with the same key, so a wrong key would
+      # strand every user. The certificate's fingerprint is public; the key itself stays secret.
+      - name: Check the APK is signed with the release key
+        env:
+          EXPECTED: faaa40cc25c414b65108609e88bcce04137c9f9d366dfed574479effa75db012
+        run: |
+          apksigner=$(ls "$ANDROID_HOME"/build-tools/*/apksigner | sort -V | tail -1)
+          "$apksigner" verify --print-certs app/build/outputs/apk/release/uPhotoSync.apk | tee certs.txt
+          if ! grep -q "certificate SHA-256 digest: $EXPECTED" certs.txt; then
+            echo "::error::The APK isn't signed with the uPhotoSync release key"
+            exit 1
+          fi
+
+      - name: Attach to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          apk=app/build/outputs/apk/release/uPhotoSync.apk
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            gh release upload "$TAG" "$apk" --clobber
+          else
+            gh release create "$TAG" "$apk" --title "uPhotoSync ${TAG#v}" --prerelease --generate-notes
+          fi
+
+      - name: Remove the signing key
+        if: always()
+        run: rm -f "$RUNNER_TEMP/release.jks" keystore.properties

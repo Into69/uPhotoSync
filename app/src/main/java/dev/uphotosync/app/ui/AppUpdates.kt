@@ -24,6 +24,7 @@ import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -44,6 +45,8 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import dev.uphotosync.app.backup.RateMeter
+import dev.uphotosync.app.backup.UpdateCheckWorker
+import dev.uphotosync.app.data.AppMeta
 import dev.uphotosync.app.data.Updater
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
@@ -191,6 +194,22 @@ fun AppUpdatesPanel(vm: UpdateViewModel = viewModel()) {
                 }
             }
         }
+        var auto by remember { mutableStateOf(AppMeta.autoUpdateCheck(context)) }
+        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+            Column(Modifier.weight(1f)) {
+                Text("Check every week")
+                Text(
+                    "On Wi-Fi; you get a notification when a new version is out",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            Switch(checked = auto, onCheckedChange = {
+                auto = it
+                AppMeta.setAutoUpdateCheck(context, it)
+                UpdateCheckWorker.schedule(context)
+            })
+        }
         when (val s = state) {
             is UpdateState.Available -> Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Button(onClick = { vm.download(s.release) }) { Text("Download and install") }
@@ -222,23 +241,36 @@ fun AppUpdatesPanel(vm: UpdateViewModel = viewModel()) {
     }
 
     notesFor?.let { r ->
-        AlertDialog(
-            onDismissRequest = { notesFor = null },
-            title = { Text("What's new in ${r.version}") },
-            text = {
-                Column(Modifier.heightIn(max = 360.dp).verticalScroll(rememberScrollState())) {
-                    Text(r.notes, style = MaterialTheme.typography.bodyMedium)
-                }
-            },
-            confirmButton = { TextButton(onClick = { notesFor = null }) { Text("Close") } },
-            dismissButton = {
-                TextButton(onClick = {
-                    context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(r.pageUrl)))
-                    notesFor = null
-                }) { Text("Open on GitHub") }
-            },
-        )
+        ReleaseNotesDialog(version = r.version, notes = r.notes, pageUrl = r.pageUrl, onDismiss = { notesFor = null })
     }
+}
+
+/** A release's notes in a scrolling dialog, with a link to the release on GitHub. */
+@Composable
+fun ReleaseNotesDialog(
+    version: String,
+    notes: String,
+    onDismiss: () -> Unit,
+    title: String = "What's new in $version",
+    pageUrl: String = "https://github.com/Into69/uPhotoSync/releases/tag/v$version",
+) {
+    val context = LocalContext.current
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(title) },
+        text = {
+            Column(Modifier.heightIn(max = 360.dp).verticalScroll(rememberScrollState())) {
+                Text(notes, style = MaterialTheme.typography.bodyMedium)
+            }
+        },
+        confirmButton = { TextButton(onClick = onDismiss) { Text("Close") } },
+        dismissButton = {
+            TextButton(onClick = {
+                runCatching { context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(pageUrl))) }
+                onDismiss()
+            }) { Text("Open on GitHub") }
+        },
+    )
 }
 
 /** Download progress in the same card style as the backup banner. */

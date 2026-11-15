@@ -27,7 +27,7 @@ Get **`uPhotoSync.apk`** from the [Releases page](https://github.com/Into69/uPho
 
 To install it, open the APK on your phone. If Android asks, allow your browser or file manager to install apps. You need **Android 10 or newer**.
 
-After that, the app can update itself: **Settings → App updates → Check for updates** finds the newest release on GitHub, downloads it and opens Android's installer. The first time, Android asks you to allow uPhotoSync to install apps. Updates only install over a build signed with the same key, so a build you compiled yourself won't take an official update (or the other way round) without uninstalling first.
+After that, the app can update itself: **Settings → App updates → Check for updates** finds the newest release on GitHub, downloads it and opens Android's installer. It also checks by itself once a week on Wi-Fi and sends a notification when a new version is out (you can turn that off there), and after an update it shows that version's release notes once. The first time, Android asks you to allow uPhotoSync to install apps. Updates only install over a build signed with the same key, so a build you compiled yourself won't take an official update (or the other way round) without uninstalling first.
 
 > This is an early build: it hasn't been widely tested yet, on UNAS or other SMB servers. Please [open an issue](https://github.com/Into69/uPhotoSync/issues) if something doesn't work, and say which NAS or server you're using.
 
@@ -71,7 +71,7 @@ After that, the app can update itself: **Settings → App updates → Check for 
 The **Tools** tab tidies up photos and videos on the phone. Nothing in it changes the NAS. Every removal is confirmed twice, first by the app and then by Android's own prompt. Files go to the phone's trash when "Phone deletes go to the trash" is on, and anything not yet on the NAS is flagged first.
 
 - **Duplicates:** finds **exact copies** (same size and SHA-256, so certain) and, optionally, **similar photos** (burst shots, re-saves, resized copies, found from a small image fingerprint) at three sensitivity levels. Matches are grouped with the best copy marked ★ Keep, picked by resolution and then the camera folder over a messaging app's copy. Every other file is labelled *Exact copy* or *Similar NN%*. Exact copies start ticked; similar ones are left for you to choose. Tap a photo to compare full screen, or to keep a different one. Fingerprints are cached, so later scans only read new files.
-- **Free up space:** photos and videos already on the NAS and older than a chosen age (1 month to 1 year, or any age). Before anything is removed, each file is looked up on the NAS again at the same size. Any that can't be confirmed stay on the phone.
+- **Free up space:** photos and videos already on the NAS and older than a chosen age (1 month to 1 year, or any age). Before anything is removed, each file is looked up on the NAS again at the same size. Any that can't be confirmed stay on the phone. To be reminded, set **Settings → Automatic backup → Suggest freeing up space** to an age. After an automatic backup, if more than 50 MB older than that is on the NAS, a notification (at most once a week) opens this tool to review. Nothing is deleted without you.
 - **Largest files:** the 200 biggest videos and photos, largest first.
 - **Folder clean-up:** phone folders by size, with Screenshots, Download, WhatsApp, Telegram and similar folders first. Open one to tick everything older than 1 month, 3 months or 1 year.
 - **Phone trash** (Android 11+): what's in Android's media trash and how many days each item has left. Restore items, delete them for good, or empty the trash to get the space back now.
@@ -161,6 +161,8 @@ keyPassword=...
 ```
 
 Without `keystore.properties`, the release APK is built unsigned.
+
+Publishing a GitHub release runs `.github/workflows/release.yml`. It tests, builds and signs the APK, checks the signing certificate, and attaches the APK to the release. The signing key comes from repository secrets; the workflow file lists them.
 
 ### Built with
 

@@ -39,13 +39,13 @@ import kotlinx.coroutines.launch
  */
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
-fun FreeUpSpaceTool(tools: ToolsViewModel, onBack: () -> Unit) {
+fun FreeUpSpaceTool(tools: ToolsViewModel, initialDays: Long = FREE_UP_DEFAULT_DAYS, onBack: () -> Unit) {
     val items by tools.items.collectAsStateWithLifecycle()
     val backedUp by tools.backedUp.collectAsStateWithLifecycle()
     val toTrash by tools.toTrash.collectAsStateWithLifecycle()
     val snackbar = remember { SnackbarHostState() }
     val scope = rememberCoroutineScope()
-    var days by rememberSaveable { mutableStateOf(FREE_UP_DEFAULT_DAYS) }
+    var days by rememberSaveable { mutableStateOf(initialDays) }
     // Everything in range starts ticked; this holds the ones the user unticked.
     var unticked by remember { mutableStateOf(emptySet<Long>()) }
     var checking by remember { mutableStateOf(false) }

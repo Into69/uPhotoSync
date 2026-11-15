@@ -30,6 +30,7 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -52,12 +53,23 @@ private enum class Tool { Duplicates, FreeUp, Largest, Folders, Trash }
 @Composable
 fun ToolsScreen(vm: ToolsViewModel = viewModel()) {
     var open by rememberSaveable { mutableStateOf<Tool?>(null) }
+    var freeUpDays by rememberSaveable { mutableStateOf(FREE_UP_DEFAULT_DAYS) }
+    // A notification asked for a tool (e.g. "you can free up 2 GB"): open it once.
+    val link by ToolLink.pending.collectAsStateWithLifecycle()
+    LaunchedEffect(link) {
+        val l = link ?: return@LaunchedEffect
+        if (l.tool == ToolLink.FREE_UP) {
+            if (l.days > 0) freeUpDays = l.days
+            open = Tool.FreeUp
+        }
+        ToolLink.pending.value = null
+    }
     // Re-read the phone every time the tab comes back, so counts match what's there now.
     LifecycleEventEffect(Lifecycle.Event.ON_START) { vm.reload() }
 
     when (open) {
         Tool.Duplicates -> return DuplicatesTool(vm, onBack = { open = null })
-        Tool.FreeUp -> return FreeUpSpaceTool(vm, onBack = { open = null })
+        Tool.FreeUp -> return FreeUpSpaceTool(vm, initialDays = freeUpDays, onBack = { open = null })
         Tool.Largest -> return LargestFilesTool(vm, onBack = { open = null })
         Tool.Folders -> return FolderCleanupTool(vm, onBack = { open = null })
         Tool.Trash -> return TrashTool(vm, onBack = { open = null })

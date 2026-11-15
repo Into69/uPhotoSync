@@ -88,6 +88,11 @@ data class BackupPrefs(
     val nasRecycle: Boolean = true,
     /** Files uploaded at the same time (1-4); more helps with many small photos. */
     val parallelUploads: Int = 3,
+    /**
+     * After an automatic backup, suggest freeing up space when files older than this many
+     * days are on the NAS (a notification to review; nothing is deleted on its own). 0 = off.
+     */
+    val autoFreeUpDays: Int = 0,
 ) {
     /** True when automatic backups are limited to specific Wi-Fi names. */
     val ssidRestricted get() = unmeteredOnly && wifiSsids.isNotEmpty()
@@ -117,6 +122,7 @@ class SettingsStore(private val context: Context) {
         val phoneTrash = booleanPreferencesKey("phone_trash")
         val nasRecycle = booleanPreferencesKey("nas_recycle")
         val parallelUploads = intPreferencesKey("parallel_uploads")
+        val autoFreeUpDays = intPreferencesKey("auto_free_up_days")
     }
 
     /** Thumbnails or details for a browser screen, remembered per [screen] ("device", "nas"). */
@@ -169,6 +175,7 @@ class SettingsStore(private val context: Context) {
             phoneTrash = p[Keys.phoneTrash] ?: true,
             nasRecycle = p[Keys.nasRecycle] ?: true,
             parallelUploads = (p[Keys.parallelUploads] ?: 3).coerceIn(1, 4),
+            autoFreeUpDays = (p[Keys.autoFreeUpDays] ?: 0).coerceAtLeast(0),
         )
     }
 
@@ -198,6 +205,7 @@ class SettingsStore(private val context: Context) {
             p[Keys.phoneTrash] = b.phoneTrash
             p[Keys.nasRecycle] = b.nasRecycle
             p[Keys.parallelUploads] = b.parallelUploads.coerceIn(1, 4)
+            p[Keys.autoFreeUpDays] = b.autoFreeUpDays.coerceAtLeast(0)
         }
     }
 }

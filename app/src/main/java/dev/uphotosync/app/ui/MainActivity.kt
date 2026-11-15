@@ -32,7 +32,9 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
+import dev.uphotosync.app.data.AppMeta
 import dev.uphotosync.app.data.CrashReport
+import dev.uphotosync.app.data.Updater
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -50,11 +52,15 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         // Only on a fresh start; after rotation the saved tab wins.
-        if (savedInstanceState == null) requestedTab.value = tabFrom(intent)
+        if (savedInstanceState == null) {
+            requestedTab.value = tabFrom(intent)
+            toolFrom(intent)
+        }
         setContent {
             AppTheme {
                 MainScreen(requestedTab = requestedTab.value, onTabShown = { requestedTab.value = null })
                 CrashReportPrompt()
+                WhatsNewPrompt()
             }
         }
     }
@@ -64,6 +70,15 @@ class MainActivity : ComponentActivity() {
         super.onNewIntent(intent)
         setIntent(intent)
         tabFrom(intent)?.let { requestedTab.value = it }
+        toolFrom(intent)
+    }
+
+    /** A notification can also ask for a tool on the Tools tab (see ToolLink). */
+    private fun toolFrom(intent: Intent?) {
+        val tool = intent?.getStringExtra(EXTRA_TOOL) ?: return
+        ToolLink.pending.value = ToolLink.Request(tool, intent.getLongExtra(EXTRA_DAYS, 0))
+        // Handled now; don't reopen it after a rotation re-delivers the same intent.
+        intent.removeExtra(EXTRA_TOOL)
     }
 
     private fun tabFrom(intent: Intent?): Tab? =
@@ -71,6 +86,20 @@ class MainActivity : ComponentActivity() {
 
     companion object {
         private const val EXTRA_TAB = "tab"
+        private const val EXTRA_TOOL = "tool"
+        private const val EXTRA_DAYS = "days"
+
+        /** Tapping a notification: opens the Tools tab on [tool] (see ToolLink), with [days] for its filter. */
+        fun openToolIntent(context: Context, tool: String, days: Long): PendingIntent = PendingIntent.getActivity(
+            context,
+            100 + tool.hashCode() % 100,
+            Intent(context, MainActivity::class.java)
+                .putExtra(EXTRA_TAB, Tab.Tools.name)
+                .putExtra(EXTRA_TOOL, tool)
+                .putExtra(EXTRA_DAYS, days)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+        )
 
         /**
          * Tapping a notification: brings the app back (resuming it if it's already running)
@@ -112,6 +141,40 @@ private fun CrashReportPrompt() {
         },
         dismissButton = { TextButton(onClick = ::dismiss) { Text("Not now") } },
     )
+}
+
+/**
+ * Once after the app is updated: that version's release notes. Skipped after a fresh install,
+ * and silently if they can't be fetched (it tries again next launch, then gives up).
+ */
+@Composable
+private fun WhatsNewPrompt() {
+    val context = LocalContext.current
+    var notes by remember { mutableStateOf<Pair<String, String>?>(null) }
+    LaunchedEffect(Unit) {
+        val updater = Updater(context)
+        val current = updater.currentVersion
+        val seen = AppMeta.seenVersion(context)
+        if (seen == current) return@LaunchedEffect
+        // No record yet: either a fresh install (nothing to announce) or an update from a
+        // version before this prompt existed; the install and update times tell them apart.
+        val updated = seen != null || runCatching {
+            val info = context.packageManager.getPackageInfo(context.packageName, 0)
+            info.lastUpdateTime > info.firstInstallTime
+        }.getOrDefault(false)
+        if (!updated) {
+            AppMeta.setSeenVersion(context, current)
+            return@LaunchedEffect
+        }
+        val text = runCatching { updater.notesFor(current) }
+        // Offline: leave it for next launch. Fetched (or no notes for this version): done.
+        if (text.isFailure) return@LaunchedEffect
+        AppMeta.setSeenVersion(context, current)
+        text.getOrNull()?.let { notes = current to it }
+    }
+    notes?.let { (version, text) ->
+        ReleaseNotesDialog(version = version, notes = text, title = "What's new in $version", onDismiss = { notes = null })
+    }
 }
 
 @Composable

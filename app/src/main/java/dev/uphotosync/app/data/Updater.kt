@@ -10,6 +10,7 @@ import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
+import org.json.JSONObject
 import java.io.File
 import java.io.IOException
 import java.net.HttpURLConnection
@@ -35,43 +36,55 @@ class Updater(private val context: Context) {
 
     /** The newest published release, drafts left out (pre-releases count: every release so far is one). */
     suspend fun latest(): Release? = withContext(Dispatchers.IO) {
-        val conn = open(RELEASES_URL).apply { setRequestProperty("Accept", "application/vnd.github+json") }
+        val releases = JSONArray(get(RELEASES_URL) ?: throw IOException("The app's GitHub releases weren't found"))
+        (0 until releases.length()).asSequence()
+            .map { releases.getJSONObject(it) }
+            .filter { !it.optBoolean("draft") }
+            .mapNotNull(::parse)
+            .maxWithOrNull { a, b -> compareVersions(a.version, b.version) }
+    }
+
+    /** Release notes for [version] (e.g. the one just installed), or null if there's no such release. */
+    suspend fun notesFor(version: String): String? = withContext(Dispatchers.IO) {
+        val body = get("$RELEASE_BY_TAG_URL/v$version") ?: return@withContext null
+        JSONObject(body).optString("body").trim().ifEmpty { null }
+    }
+
+    /** A GitHub API GET; null for 404, an error with a readable message for anything else that failed. */
+    private fun get(url: String): String? {
+        val conn = open(url).apply { setRequestProperty("Accept", "application/vnd.github+json") }
         try {
             val code = conn.responseCode
             val rateLimited = code == 429 ||
                 (code == HttpURLConnection.HTTP_FORBIDDEN && conn.getHeaderField("X-RateLimit-Remaining") == "0")
             when {
                 code == HttpURLConnection.HTTP_OK -> Unit
+                code == HttpURLConnection.HTTP_NOT_FOUND -> return null
                 rateLimited -> throw IOException("GitHub is limiting requests. Try again in a while.")
-                code == HttpURLConnection.HTTP_NOT_FOUND -> throw IOException("The app's GitHub releases weren't found")
                 else -> throw IOException("GitHub refused the request ($code)")
             }
-            val releases = JSONArray(conn.inputStream.bufferedReader().use { it.readText() })
-            (0 until releases.length()).asSequence()
-                .map { releases.getJSONObject(it) }
-                .filter { !it.optBoolean("draft") }
-                .mapNotNull { r ->
-                    val assets = r.optJSONArray("assets") ?: return@mapNotNull null
-                    val apk = (0 until assets.length()).map { assets.getJSONObject(it) }
-                        .firstOrNull { it.optString("name").endsWith(".apk", ignoreCase = true) }
-                        ?: return@mapNotNull null
-                    // An asset still uploading (or otherwise incomplete) has no link yet: skip that release.
-                    val url = apk.optString("browser_download_url").takeIf { it.startsWith("https://") }
-                        ?: return@mapNotNull null
-                    val version = r.optString("tag_name").removePrefix("v").takeIf { it.isNotBlank() }
-                        ?: return@mapNotNull null
-                    Release(
-                        version = version,
-                        notes = r.optString("body").trim(),
-                        apkUrl = url,
-                        apkSize = apk.optLong("size"),
-                        pageUrl = r.optString("html_url"),
-                    )
-                }
-                .maxWithOrNull { a, b -> compareVersions(a.version, b.version) }
+            return conn.inputStream.bufferedReader().use { it.readText() }
         } finally {
             conn.disconnect()
         }
+    }
+
+    /** A release with an APK attached, or null (no APK, still uploading, no tag). */
+    private fun parse(r: JSONObject): Release? {
+        val assets = r.optJSONArray("assets") ?: return null
+        val apk = (0 until assets.length()).map { assets.getJSONObject(it) }
+            .firstOrNull { it.optString("name").endsWith(".apk", ignoreCase = true) }
+            ?: return null
+        // An asset still uploading (or otherwise incomplete) has no link yet: skip that release.
+        val url = apk.optString("browser_download_url").takeIf { it.startsWith("https://") } ?: return null
+        val version = r.optString("tag_name").removePrefix("v").takeIf { it.isNotBlank() } ?: return null
+        return Release(
+            version = version,
+            notes = r.optString("body").trim(),
+            apkUrl = url,
+            apkSize = apk.optLong("size"),
+            pageUrl = r.optString("html_url"),
+        )
     }
 
     fun isNewer(release: Release) = compareVersions(release.version, currentVersion) > 0
@@ -145,6 +158,7 @@ class Updater(private val context: Context) {
 
     companion object {
         private const val RELEASES_URL = "https://api.github.com/repos/Into69/uPhotoSync/releases?per_page=20"
+        private const val RELEASE_BY_TAG_URL = "https://api.github.com/repos/Into69/uPhotoSync/releases/tags"
         private const val UPDATE_DIR = "updates"
 
         /**

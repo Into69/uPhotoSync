@@ -8,6 +8,7 @@ import coil.ImageLoaderFactory
 import coil.decode.VideoFrameDecoder
 import dev.uphotosync.app.backup.BackupEngine
 import dev.uphotosync.app.backup.BackupScheduler
+import dev.uphotosync.app.backup.UpdateCheckWorker
 import dev.uphotosync.app.data.BackupHistory
 import dev.uphotosync.app.data.CrashReport
 import dev.uphotosync.app.data.BackupIndex
@@ -57,12 +58,17 @@ class PhotoSyncApp : Application(), ImageLoaderFactory {
                 NotificationChannel(CHANNEL_REPORTS, "Backup reports", NotificationManager.IMPORTANCE_LOW).apply {
                     description = "Summary after each scheduled backup"
                 },
+                NotificationChannel(CHANNEL_UPDATES, "App updates", NotificationManager.IMPORTANCE_LOW).apply {
+                    description = "When a new version of uPhotoSync is available"
+                },
             )
         )
         // Re-apply the auto-backup schedule in case it was lost (app update, cleared data).
         graph.appScope.launch {
             graph.scheduler.apply(graph.settings.prefs.first(), replaceTrigger = false)
         }
+        // Weekly "is there a new version?" check (Settings > App updates can turn it off).
+        UpdateCheckWorker.schedule(this)
     }
 
     override fun newImageLoader(): ImageLoader = ImageLoader.Builder(this)
@@ -79,5 +85,6 @@ class PhotoSyncApp : Application(), ImageLoaderFactory {
     companion object {
         const val CHANNEL_BACKUP = "backup"
         const val CHANNEL_REPORTS = "reports"
+        const val CHANNEL_UPDATES = "updates"
     }
 }

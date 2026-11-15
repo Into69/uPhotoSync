@@ -377,6 +377,32 @@ fun SettingsScreen(vm: SettingsViewModel = viewModel()) {
                         Text("${a.name} (${a.count})")
                     }
                 }
+                Text(
+                    "Suggest freeing up space",
+                    style = MaterialTheme.typography.titleSmall,
+                    modifier = Modifier.padding(top = 8.dp),
+                )
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    listOf(0 to "Off", 30 to "1 month", 90 to "3 months", 180 to "6 months", 365 to "1 year").forEach { (d, label) ->
+                        FilterChip(
+                            selected = prefs.autoFreeUpDays == d,
+                            enabled = prefs.anyAutomatic || d == 0,
+                            onClick = { vm.setPrefs(prefs.copy(autoFreeUpDays = d)) },
+                            label = { Text(label) },
+                        )
+                    }
+                }
+                Text(
+                    if (prefs.autoFreeUpDays == 0) {
+                        "After an automatic backup, get a reminder when older photos are safely on the NAS."
+                    } else {
+                        "After an automatic backup, if more than 50 MB of photos and videos older than this are on " +
+                            "the NAS, you get a notification (at most once a week). Tap it to review in Tools; " +
+                            "nothing is deleted without you."
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
 
                 HorizontalDivider(Modifier.padding(vertical = 8.dp))
                 Section("Safety & speed")
