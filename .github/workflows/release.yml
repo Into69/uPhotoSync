@@ -33,19 +33,24 @@ jobs:
     env:
       TAG: ${{ github.event.release.tag_name || inputs.tag }}
     steps:
-      - uses: actions/checkout@v5
+      # Actions are pinned to exact commits: this job holds the signing key, so a moved tag
+      # mustn't be able to swap in different code. (checkout v5.1.0, setup-java v5.7.0)
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
           ref: ${{ env.TAG }}
+          # Don't leave the write token in .git/config while Gradle runs third-party code;
+          # the attach step gets its own token.
+          persist-credentials: false
 
-      - uses: actions/setup-java@v5
+      # No Gradle cache: a cache saved by another workflow would run here, next to the key.
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961
         with:
           distribution: temurin
           java-version: "17"
-          cache: gradle
 
       - name: Check the tag matches versionName
         run: |
-          version=$(sed -n 's/.*versionName = "\(.*\)".*/\1/p' app/build.gradle.kts)
+          version=$(sed -n 's/^ *versionName = "\(.*\)".*/\1/p' app/build.gradle.kts | head -1)
           if [ "v$version" != "$TAG" ]; then
             echo "::error::Tag $TAG doesn't match versionName $version in app/build.gradle.kts"
             exit 1
@@ -63,11 +68,13 @@ jobs:
             exit 1
           fi
           echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
+          # .properties files treat a backslash as an escape, so double each one to keep values exact.
+          esc() { printf '%s' "$1" | sed 's/\\/\\\\/g'; }
           {
             echo "storeFile=$RUNNER_TEMP/release.jks"
-            echo "storePassword=$KEYSTORE_PASSWORD"
-            echo "keyAlias=$KEY_ALIAS"
-            echo "keyPassword=$KEY_PASSWORD"
+            echo "storePassword=$(esc "$KEYSTORE_PASSWORD")"
+            echo "keyAlias=$(esc "$KEY_ALIAS")"
+            echo "keyPassword=$(esc "$KEY_PASSWORD")"
           } > keystore.properties
 
       - name: Test and build
