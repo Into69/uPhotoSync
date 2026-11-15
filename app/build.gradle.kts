@@ -14,8 +14,8 @@ android {
         applicationId = "dev.uphotosync.app"
         minSdk = 29
         targetSdk = 35
-        versionCode = 14
-        versionName = "0.1.13"
+        versionCode = 15
+        versionName = "0.1.14"
     }
 
     // Release signing key lives outside the repo; keystore.properties (git-ignored) points to it.

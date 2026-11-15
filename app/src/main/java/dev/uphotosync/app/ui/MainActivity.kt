@@ -14,6 +14,7 @@ import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.consumeWindowInsets
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.CleaningServices
 import androidx.compose.material.icons.filled.PhotoLibrary
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Storage
@@ -129,6 +130,7 @@ fun AppTheme(content: @Composable () -> Unit) {
 enum class Tab(val label: String, val icon: ImageVector) {
     Device("Device", Icons.Filled.PhotoLibrary),
     Nas("NAS", Icons.Filled.Storage),
+    Tools("Tools", Icons.Filled.CleaningServices),
     Settings("Settings", Icons.Filled.Settings),
 }
 
@@ -162,6 +164,7 @@ private fun MainScreen(requestedTab: Tab?, onTabShown: () -> Unit) {
             when (tab) {
                 Tab.Device -> DeviceScreen(onOpenSettings = { tab = Tab.Settings })
                 Tab.Nas -> NasScreen(onOpenSettings = { tab = Tab.Settings })
+                Tab.Tools -> ToolsScreen()
                 Tab.Settings -> SettingsScreen()
             }
         }

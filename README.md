@@ -66,6 +66,16 @@ After that, the app can update itself: **Settings → App updates → Check for 
 - **Your choice of folder:** you choose the destination folder on the NAS, and the app creates folders there if needed.
 - **Safe uploads:** each file is written under a temporary name and renamed only once complete, so an interrupted upload never looks finished. Photo location (GPS) data is kept.
 
+## Phone tools
+
+The **Tools** tab tidies up photos and videos on the phone. Nothing in it changes the NAS. Every removal is confirmed twice, first by the app and then by Android's own prompt. Files go to the phone's trash when "Phone deletes go to the trash" is on, and anything not yet on the NAS is flagged first.
+
+- **Duplicates:** finds **exact copies** (same size and SHA-256, so certain) and, optionally, **similar photos** (burst shots, re-saves, resized copies, found from a small image fingerprint) at three sensitivity levels. Matches are grouped with the best copy marked ★ Keep, picked by resolution and then the camera folder over a messaging app's copy. Every other file is labelled *Exact copy* or *Similar NN%*. Exact copies start ticked; similar ones are left for you to choose. Tap a photo to compare full screen, or to keep a different one. Fingerprints are cached, so later scans only read new files.
+- **Free up space:** photos and videos already on the NAS and older than a chosen age (1 month to 1 year, or any age). Before anything is removed, each file is looked up on the NAS again at the same size. Any that can't be confirmed stay on the phone.
+- **Largest files:** the 200 biggest videos and photos, largest first.
+- **Folder clean-up:** phone folders by size, with Screenshots, Download, WhatsApp, Telegram and similar folders first. Open one to tick everything older than 1 month, 3 months or 1 year.
+- **Phone trash** (Android 11+): what's in Android's media trash and how many days each item has left. Restore items, delete them for good, or empty the trash to get the space back now.
+
 ## How syncing works
 
 uPhotoSync is a **one-way backup**, not a two-way sync. It never deletes anything on the NAS.

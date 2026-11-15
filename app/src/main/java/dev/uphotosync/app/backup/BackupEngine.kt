@@ -139,6 +139,31 @@ class BackupEngine(
         }
     }
 
+    /**
+     * Which of [items] have a copy on the NAS right now: recorded as backed up, in the current
+     * destination, and listed on the share at the same size. Used before "Free up space"
+     * deletes anything from the phone; the local record alone could be out of date.
+     */
+    suspend fun confirmOnNas(items: List<MediaItem>): Set<Long> {
+        val config = settings.config.first() ?: throw NasNotConfiguredException()
+        val recorded = index.entries()
+        val destination = NasPath.clean(config.destination).lowercase()
+        val cache = FolderCache()
+        val ok = HashSet<Long>()
+        nas.withShare { share ->
+            ok.clear()
+            for (item in items) {
+                currentCoroutineContext().ensureActive()
+                if (!index.isBackedUp(item)) continue
+                val path = recorded[item.id]?.first ?: continue
+                if (destination.isNotEmpty() && !path.lowercase().startsWith("$destination\\")) continue
+                val remote = cache.files(share, NasPath.parent(path))[NasPath.name(path).lowercase()]
+                if (remote?.size == item.size) ok += item.id
+            }
+        }
+        return ok
+    }
+
     // --- Backup -------------------------------------------------------------------------
 
     suspend fun run(items: List<MediaItem>, onProgress: suspend (Progress) -> Unit): Summary = lock.withLock {

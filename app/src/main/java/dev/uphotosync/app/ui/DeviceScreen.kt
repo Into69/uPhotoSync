@@ -28,7 +28,6 @@ import androidx.compose.material3.Surface
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LifecycleEventEffect
 import android.app.Activity
-import android.app.RecoverableSecurityException
 import android.content.IntentSender
 import android.os.Build
 import androidx.activity.result.IntentSenderRequest
@@ -56,6 +55,7 @@ import androidx.compose.material3.Checkbox
 import androidx.compose.material3.ListItem
 import androidx.compose.material3.ListItemDefaults
 import androidx.compose.ui.text.style.TextOverflow
+import dev.uphotosync.app.data.PhoneMediaRequest
 import dev.uphotosync.app.data.PhoneStorage
 import dev.uphotosync.app.data.SortOrder
 import dev.uphotosync.app.data.StorageSpace
@@ -280,18 +280,15 @@ class DeviceViewModel(app: Application) : AndroidViewModel(app) {
         return s.items.count { it.id in s.selected && !s.isBackedUp(it) }
     }
 
-    private var pendingDelete: List<MediaItem> = emptyList()
-    private val deletedIds = ArrayList<Long>()
+    private val deleteRequest = PhoneMediaRequest(app)
     private var deleteFromSelection = false
-    private var deleteToTrash = false
 
     /** Phone deletes go to Android's trash (Android 11+, if turned on in Settings). */
     val deletesGoToTrash = graph.settings.prefs.map { it.phoneTrash && trashSupported() }
         .stateIn(viewModelScope, SharingStarted.Eagerly, trashSupported())
 
     /** True while a delete (and its system confirmation) is in progress; only one at a time. */
-    var deleting = false
-        private set
+    val deleting get() = deleteRequest.busy
 
     /**
      * "Move to NAS" items whose NAS copy has been verified, still on the phone and waiting
@@ -341,68 +338,29 @@ class DeviceViewModel(app: Application) : AndroidViewModel(app) {
         // A second delete would overwrite this one's batch and misreport what was deleted.
         if (deleting) return null
         val ids = selected.value
+        val batch = items ?: all.value.orEmpty().filter { it.id in ids }
+        if (batch.isEmpty()) return null
         deleteFromSelection = items == null
-        pendingDelete = items ?: all.value.orEmpty().filter { it.id in ids }
-        deletedIds.clear()
-        if (pendingDelete.isEmpty()) return null
-        deleting = true
-        val resolver = getApplication<Application>().contentResolver
-        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            // One system dialog for the whole batch; the system deletes (or trashes) them if the
-            // user agrees. Trashed files can be restored from the gallery for 30 days.
-            deleteToTrash = graph.settings.prefs.first().phoneTrash
-            val uris = pendingDelete.map { it.uri }
-            if (deleteToTrash) MediaStore.createTrashRequest(resolver, uris, true).intentSender
-            else MediaStore.createDeleteRequest(resolver, uris).intentSender
-        } else {
-            deleteToTrash = false
-            continueDelete()
-        }
+        // Trashed files can be restored from the gallery (or Tools > Phone trash) for 30 days.
+        val action = if (graph.settings.prefs.first().phoneTrash) PhoneMediaRequest.Action.Trash
+        else PhoneMediaRequest.Action.Delete
+        return deleteRequest.start(batch.map { PhoneMediaRequest.Target(it.id, it.uri) }, action)
     }
 
-    /**
-     * Android 10: delete one by one. For each photo the app didn't create, Android asks
-     * the user first; returns that prompt, and is called again once it's been allowed.
-     */
-    suspend fun continueDelete(): IntentSender? = withContext(Dispatchers.IO) {
-        val resolver = getApplication<Application>().contentResolver
-        while (pendingDelete.isNotEmpty()) {
-            val item = pendingDelete.first()
-            try {
-                resolver.delete(item.uri, null, null)
-                deletedIds += item.id
-            } catch (e: RecoverableSecurityException) {
-                return@withContext e.userAction.actionIntent.intentSender
-            } catch (e: Exception) {
-                // Already gone, or the provider refused outright: skip it rather than crash.
-            }
-            pendingDelete = pendingDelete.drop(1)
-        }
-        null
-    }
+    /** Android 10: carries on deleting after the user allowed one photo. */
+    suspend fun continueDelete(): IntentSender? = deleteRequest.continueDelete()
 
     /** Called when deleting is finished or cancelled; returns a message for the user. */
     fun finishDelete(confirmedBatch: Boolean): String {
-        // Android 11+: the system did the deleting, so count the whole batch if it was confirmed.
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && confirmedBatch) {
-            deletedIds.clear()
-            deletedIds += pendingDelete.map { it.id }
-        }
+        val toTrash = deleteRequest.action == PhoneMediaRequest.Action.Trash
+        val deletedIds = deleteRequest.finish(confirmedBatch)
         val n = deletedIds.size
         // A finished move: these no longer need deleting.
         graph.moves.remove(deletedIds)
-        pendingDelete = emptyList()
-        deletedIds.clear()
         // Only clear the selection if that's what was being deleted (not a finished move).
         if (deleteFromSelection) clearSelection()
-        deleting = false
         reload()
-        val items = if (n == 1) "item" else "items"
-        return when {
-            n == 0 -> "Nothing deleted"
-            deleteToTrash -> "Moved $n $items to the trash (restorable for 30 days)"
-            else -> "Deleted $n $items from this phone"
-        }
+        return deleteMessage(n, toTrash)
     }
 
     /** Returns false if the NAS isn't set up yet. */
@@ -734,8 +692,18 @@ private const val SPACE_CHECK_TIMEOUT_MS = 3_000L
 /** Android's trash for media (createTrashRequest) arrived in Android 11. */
 fun trashSupported() = Build.VERSION.SDK_INT >= Build.VERSION_CODES.R
 
+/** "Moved 3 items to the trash…" / "Deleted 3 items from this phone" after a phone delete. */
+fun deleteMessage(n: Int, toTrash: Boolean): String {
+    val items = if (n == 1) "item" else "items"
+    return when {
+        n == 0 -> "Nothing deleted"
+        toTrash -> "Moved $n $items to the trash (restorable for 30 days)"
+        else -> "Deleted $n $items from this phone"
+    }
+}
+
 @Composable
-private fun UnbackedDeleteDialog(count: Int, toTrash: Boolean, onConfirm: () -> Unit, onDismiss: () -> Unit) {
+internal fun UnbackedDeleteDialog(count: Int, toTrash: Boolean, onConfirm: () -> Unit, onDismiss: () -> Unit) {
     AlertDialog(
         onDismissRequest = onDismiss,
         icon = { Icon(Icons.Filled.Warning, null, tint = MaterialTheme.colorScheme.error) },
