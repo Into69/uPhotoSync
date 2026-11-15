@@ -34,7 +34,9 @@ class UpdateCheckWorker(context: Context, params: WorkerParameters) : CoroutineW
         if (!updater.isNewer(latest) || AppMeta.notifiedUpdate(context) == latest.version) return Result.success()
 
         val notifications = NotificationManagerCompat.from(context)
-        if (notifications.areNotificationsEnabled()) {
+        // Notifications off: say nothing and don't mark it, so it's announced once they're on.
+        if (!notifications.areNotificationsEnabled()) return Result.success()
+        run {
             val notification = NotificationCompat.Builder(context, PhotoSyncApp.CHANNEL_UPDATES)
                 .setSmallIcon(R.drawable.ic_backup)
                 .setContentTitle("uPhotoSync ${latest.version} is available")
@@ -42,9 +44,9 @@ class UpdateCheckWorker(context: Context, params: WorkerParameters) : CoroutineW
                 .setContentIntent(MainActivity.openIntent(context, Tab.Settings))
                 .setAutoCancel(true)
                 .build()
-            runCatching { notifications.notify(NOTIFICATION_ID, notification) }
+            val posted = runCatching { notifications.notify(NOTIFICATION_ID, notification) }.isSuccess
+            if (posted) AppMeta.setNotifiedUpdate(context, latest.version)
         }
-        AppMeta.setNotifiedUpdate(context, latest.version)
         return Result.success()
     }
 

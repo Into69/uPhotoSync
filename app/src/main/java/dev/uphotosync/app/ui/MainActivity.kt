@@ -92,7 +92,9 @@ class MainActivity : ComponentActivity() {
         /** Tapping a notification: opens the Tools tab on [tool] (see ToolLink), with [days] for its filter. */
         fun openToolIntent(context: Context, tool: String, days: Long): PendingIntent = PendingIntent.getActivity(
             context,
-            100 + tool.hashCode() % 100,
+            // Fixed per tool and well away from openIntent's codes (Tab.ordinal), so neither
+            // PendingIntent overwrites the other's extras.
+            1000 + Math.floorMod(tool.hashCode(), 1000),
             Intent(context, MainActivity::class.java)
                 .putExtra(EXTRA_TAB, Tab.Tools.name)
                 .putExtra(EXTRA_TOOL, tool)
@@ -144,14 +146,17 @@ private fun CrashReportPrompt() {
 }
 
 /**
- * Once after the app is updated: that version's release notes. Skipped after a fresh install,
- * and silently if they can't be fetched (it tries again next launch, then gives up).
+ * Once after the app is updated: that version's release notes. Skipped after a fresh install.
+ * If the notes can't be fetched it tries again on the next few launches, then gives up.
+ * The version only counts as seen once the dialog is closed, so a rotation doesn't lose it.
  */
 @Composable
 private fun WhatsNewPrompt() {
     val context = LocalContext.current
-    var notes by remember { mutableStateOf<Pair<String, String>?>(null) }
+    var version by rememberSaveable { mutableStateOf<String?>(null) }
+    var notes by rememberSaveable { mutableStateOf<String?>(null) }
     LaunchedEffect(Unit) {
+        if (notes != null) return@LaunchedEffect // restored after a rotation
         val updater = Updater(context)
         val current = updater.currentVersion
         val seen = AppMeta.seenVersion(context)
@@ -167,15 +172,31 @@ private fun WhatsNewPrompt() {
             return@LaunchedEffect
         }
         val text = runCatching { updater.notesFor(current) }
-        // Offline: leave it for next launch. Fetched (or no notes for this version): done.
-        if (text.isFailure) return@LaunchedEffect
-        AppMeta.setSeenVersion(context, current)
-        text.getOrNull()?.let { notes = current to it }
+        if (text.isFailure) {
+            val tries = AppMeta.notesAttempts(context, current) + 1
+            AppMeta.setNotesAttempts(context, current, tries)
+            if (tries >= MAX_NOTES_ATTEMPTS) AppMeta.setSeenVersion(context, current)
+            return@LaunchedEffect
+        }
+        val body = text.getOrNull()
+        if (body == null) {
+            AppMeta.setSeenVersion(context, current) // no notes for this version
+        } else {
+            version = current
+            notes = body
+        }
     }
-    notes?.let { (version, text) ->
-        ReleaseNotesDialog(version = version, notes = text, title = "What's new in $version", onDismiss = { notes = null })
+    val v = version
+    val n = notes
+    if (v != null && n != null) {
+        ReleaseNotesDialog(version = v, notes = n, title = "What's new in $v", onDismiss = {
+            AppMeta.setSeenVersion(context, v)
+            notes = null
+        })
     }
 }
+
+private const val MAX_NOTES_ATTEMPTS = 3
 
 @Composable
 fun AppTheme(content: @Composable () -> Unit) {

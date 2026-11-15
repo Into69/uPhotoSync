@@ -25,6 +25,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import dev.uphotosync.app.data.FreeUp
 import dev.uphotosync.app.data.MediaItem
 import dev.uphotosync.app.data.PhoneMediaRequest
 import dev.uphotosync.app.smb.NasClient
@@ -39,13 +40,14 @@ import kotlinx.coroutines.launch
  */
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
-fun FreeUpSpaceTool(tools: ToolsViewModel, initialDays: Long = FREE_UP_DEFAULT_DAYS, onBack: () -> Unit) {
+fun FreeUpSpaceTool(tools: ToolsViewModel, initialDays: Long = FreeUp.DEFAULT_DAYS, onBack: () -> Unit) {
     val items by tools.items.collectAsStateWithLifecycle()
     val backedUp by tools.backedUp.collectAsStateWithLifecycle()
     val toTrash by tools.toTrash.collectAsStateWithLifecycle()
     val snackbar = remember { SnackbarHostState() }
     val scope = rememberCoroutineScope()
-    var days by rememberSaveable { mutableStateOf(initialDays) }
+    // Keyed on initialDays: a notification tapped while the tool is open switches to its age.
+    var days by rememberSaveable(initialDays) { mutableStateOf(initialDays) }
     // Everything in range starts ticked; this holds the ones the user unticked.
     var unticked by remember { mutableStateOf(emptySet<Long>()) }
     var checking by remember { mutableStateOf(false) }
@@ -53,8 +55,7 @@ fun FreeUpSpaceTool(tools: ToolsViewModel, initialDays: Long = FREE_UP_DEFAULT_D
     var viewerIndex by remember { mutableStateOf<Int?>(null) }
 
     val candidates = remember(items, backedUp, days) {
-        val cutoff = System.currentTimeMillis() - days * DAY_MS
-        items.orEmpty().filter { backedUp.has(it) && (days == 0L || it.takenAt < cutoff) }.sortedBy { it.takenAt }
+        FreeUp.candidates(items.orEmpty(), days, { backedUp.has(it) })
     }
     val chosen = candidates.filter { it.id !in unticked }
     val bytes = chosen.sumOf { it.size }
@@ -121,7 +122,7 @@ fun FreeUpSpaceTool(tools: ToolsViewModel, initialDays: Long = FREE_UP_DEFAULT_D
                     )
                     Text("Older than", style = MaterialTheme.typography.bodyMedium)
                     FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        listOf(30L to "1 month", 90L to "3 months", 180L to "6 months", 365L to "1 year", 0L to "Any age")
+                        (FreeUp.AGES + (0L to "Any age"))
                             .forEach { (d, label) ->
                                 FilterChip(selected = days == d, onClick = { days = d; unticked = emptySet() }, label = { Text(label) })
                             }

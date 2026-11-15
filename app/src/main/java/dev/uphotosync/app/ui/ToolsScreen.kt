@@ -45,6 +45,7 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LifecycleEventEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import dev.uphotosync.app.data.FreeUp
 
 private enum class Tool { Duplicates, FreeUp, Largest, Folders, Trash }
 
@@ -53,7 +54,8 @@ private enum class Tool { Duplicates, FreeUp, Largest, Folders, Trash }
 @Composable
 fun ToolsScreen(vm: ToolsViewModel = viewModel()) {
     var open by rememberSaveable { mutableStateOf<Tool?>(null) }
-    var freeUpDays by rememberSaveable { mutableStateOf(FREE_UP_DEFAULT_DAYS) }
+    // Age the Free up space tool starts on: a notification's, or the default. Reset on close.
+    var freeUpDays by rememberSaveable { mutableStateOf(FreeUp.DEFAULT_DAYS) }
     // A notification asked for a tool (e.g. "you can free up 2 GB"): open it once.
     val link by ToolLink.pending.collectAsStateWithLifecycle()
     LaunchedEffect(link) {
@@ -69,7 +71,10 @@ fun ToolsScreen(vm: ToolsViewModel = viewModel()) {
 
     when (open) {
         Tool.Duplicates -> return DuplicatesTool(vm, onBack = { open = null })
-        Tool.FreeUp -> return FreeUpSpaceTool(vm, initialDays = freeUpDays, onBack = { open = null })
+        Tool.FreeUp -> return FreeUpSpaceTool(vm, initialDays = freeUpDays, onBack = {
+            open = null
+            freeUpDays = FreeUp.DEFAULT_DAYS
+        })
         Tool.Largest -> return LargestFilesTool(vm, onBack = { open = null })
         Tool.Folders -> return FolderCleanupTool(vm, onBack = { open = null })
         Tool.Trash -> return TrashTool(vm, onBack = { open = null })
@@ -79,8 +84,7 @@ fun ToolsScreen(vm: ToolsViewModel = viewModel()) {
     val items by vm.items.collectAsStateWithLifecycle()
     val backedUp by vm.backedUp.collectAsStateWithLifecycle()
     val freeable = remember(items, backedUp) {
-        val cutoff = System.currentTimeMillis() - FREE_UP_DEFAULT_DAYS * DAY_MS
-        items.orEmpty().filter { backedUp.has(it) && it.takenAt < cutoff }.sumOf { it.size }
+        FreeUp.candidates(items.orEmpty(), FreeUp.DEFAULT_DAYS, { backedUp.has(it) }).sumOf { it.size }
     }
     val total = remember(items) { items.orEmpty().sumOf { it.size } }
 
@@ -143,5 +147,4 @@ private fun ToolCard(icon: ImageVector, title: String, detail: String, onClick: 
     }
 }
 
-internal const val DAY_MS = 24L * 60 * 60 * 1000
-internal const val FREE_UP_DEFAULT_DAYS = 180L
+internal const val DAY_MS = FreeUp.DAY_MS

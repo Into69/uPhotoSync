@@ -71,6 +71,7 @@ import dev.uphotosync.app.PhotoSyncApp
 import dev.uphotosync.app.backup.BackupScope
 import dev.uphotosync.app.data.Album
 import dev.uphotosync.app.data.BackupPrefs
+import dev.uphotosync.app.data.FreeUp
 import dev.uphotosync.app.data.NasConfig
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -383,7 +384,7 @@ fun SettingsScreen(vm: SettingsViewModel = viewModel()) {
                     modifier = Modifier.padding(top = 8.dp),
                 )
                 FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    listOf(0 to "Off", 30 to "1 month", 90 to "3 months", 180 to "6 months", 365 to "1 year").forEach { (d, label) ->
+                    (listOf(0 to "Off") + FreeUp.AGES.map { (d, label) -> d.toInt() to label }).forEach { (d, label) ->
                         FilterChip(
                             selected = prefs.autoFreeUpDays == d,
                             enabled = prefs.anyAutomatic || d == 0,

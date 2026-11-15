@@ -1,5 +1,6 @@
 package dev.uphotosync.app.backup
 
+import dev.uphotosync.app.data.FreeUp
 import dev.uphotosync.app.ui.ToolLink
 import dev.uphotosync.app.data.AppMeta
 import android.app.PendingIntent
@@ -150,7 +151,6 @@ class BackupWorker(context: Context, params: WorkerParameters) : CoroutineWorker
 
             val items = selectItems(graph.media.loadAll(), idsFile)
             val summary = graph.engine.run(items, onProgress)
-            if (automatic && !summary.aborted) suggestFreeUp()
 
             // "Move to NAS": prove each copy is identical, then hand the verified ones to the
             // app to delete from the phone (Android only allows that with the user's OK).
@@ -200,6 +200,16 @@ class BackupWorker(context: Context, params: WorkerParameters) : CoroutineWorker
                     startedAt = startedAt,
                     summary.uploaded, summary.alreadyThere, summary.failed, summary.bytesUploaded, summary.errors,
                 )
+            }
+            // Last, after the report: it's only a reminder, so it mustn't hold up or fail the backup.
+            if (automatic && !summary.aborted) {
+                try {
+                    suggestFreeUp()
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    // No reminder this time; the next backup tries again.
+                }
             }
             return when {
                 willRetry -> Result.retry().also { retrying = true }
@@ -394,7 +404,6 @@ class BackupWorker(context: Context, params: WorkerParameters) : CoroutineWorker
         }
     }
 
-    /** The end-of-run report; replaces the progress notification and stays until dismissed. */
     /**
      * "Suggest freeing up space": once a week at most, if enough old photos and videos are
      * backed up (as of the run that just finished), post a notification that opens the Free up
@@ -406,15 +415,12 @@ class BackupWorker(context: Context, params: WorkerParameters) : CoroutineWorker
         if (days <= 0) return
         val now = System.currentTimeMillis()
         if (now - AppMeta.freeUpNotifiedAt(applicationContext) < FREE_UP_EVERY_MS) return
-        val cutoff = now - days * 24L * 60 * 60 * 1000
-        val ready = graph.media.loadAll().filter { it.takenAt < cutoff && graph.index.isBackedUp(it) }
+        if (!notifications.areNotificationsEnabled()) return
+        // The same filter the Free up space tool uses, so the numbers match when it opens.
+        val ready = FreeUp.candidates(graph.media.loadAll(), days.toLong(), graph.index::isBackedUp, now)
         val bytes = ready.sumOf { it.size }
-        if (bytes < FREE_UP_MIN_BYTES || !notifications.areNotificationsEnabled()) return
-        val age = when (days) {
-            30 -> "1 month"
-            365 -> "1 year"
-            else -> "${days / 30} months"
-        }
+        if (bytes < FREE_UP_MIN_BYTES) return
+        val age = FreeUp.label(days.toLong())
         val text = "${ready.size} photos and videos older than $age are on the NAS. Tap to review and free up space on the phone."
         val notification = NotificationCompat.Builder(applicationContext, PhotoSyncApp.CHANNEL_REPORTS)
             .setSmallIcon(R.drawable.ic_backup)
@@ -428,6 +434,7 @@ class BackupWorker(context: Context, params: WorkerParameters) : CoroutineWorker
         AppMeta.setFreeUpNotifiedAt(applicationContext, now)
     }
 
+    /** The end-of-run report; replaces the progress notification and stays until dismissed. */
     private fun postReport(title: String, text: String, tab: Tab = Tab.Device) {
         if (!notifications.areNotificationsEnabled()) return
         val notification = NotificationCompat.Builder(applicationContext, PhotoSyncApp.CHANNEL_REPORTS)

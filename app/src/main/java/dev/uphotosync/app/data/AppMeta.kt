@@ -26,6 +26,13 @@ object AppMeta {
 
     fun setSeenVersion(context: Context, version: String) = prefs(context).edit { putString(KEY_SEEN_VERSION, version) }
 
+    /** Failed attempts to fetch [version]'s release notes; the prompt gives up after a few. */
+    fun notesAttempts(context: Context, version: String): Int =
+        prefs(context).getInt(KEY_NOTES_ATTEMPTS + version, 0)
+
+    fun setNotesAttempts(context: Context, version: String, n: Int) =
+        prefs(context).edit { putInt(KEY_NOTES_ATTEMPTS + version, n) }
+
     /** When the "you can free up space" notification was last posted (epoch millis). */
     fun freeUpNotifiedAt(context: Context): Long = prefs(context).getLong(KEY_FREE_UP_AT, 0)
 
@@ -35,4 +42,5 @@ object AppMeta {
     private const val KEY_NOTIFIED_UPDATE = "notified_update"
     private const val KEY_SEEN_VERSION = "seen_version"
     private const val KEY_FREE_UP_AT = "free_up_notified_at"
+    private const val KEY_NOTES_ATTEMPTS = "notes_attempts_"
 }
